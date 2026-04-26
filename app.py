@@ -8,6 +8,7 @@ import sqlite3
 import time
 import unicodedata
 import zipfile
+import xml.etree.ElementTree as ET
 from datetime import datetime
 from html import escape
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -20,6 +21,15 @@ DB_PATH = Path(os.environ.get('DB_PATH', str(DATA_DIR / 'consumo_chapas.db')))
 SEED_DB_PATH = BASE_DIR / 'consumo_chapas.db'
 EXCEL_CANDIDATOS = [BASE_DIR / 'Consumo_de_chapa_por_lote.xlsx', BASE_DIR / 'Consumo de chapa por lote.xlsx']
 EXCEL_PATH = next((c for c in EXCEL_CANDIDATOS if c.exists()), EXCEL_CANDIDATOS[0])
+PRODUCAO_CANDIDATOS = [
+    DATA_DIR / '00-PRODUÇÃO GERAL 2026.xlsx',
+    DATA_DIR / '00-PRODUCAO_GERAL_2026.xlsx',
+    DATA_DIR / 'producao_geral_2026.xlsx',
+    BASE_DIR / '00-PRODUÇÃO GERAL 2026.xlsx',
+    BASE_DIR / '00-PRODUCAO_GERAL_2026.xlsx',
+    BASE_DIR / 'producao_geral_2026.xlsx',
+]
+ABA_PRODUCAO_DOBUE = os.environ.get('ABA_PRODUCAO_DOBUE', 'DOBUÊ')
 RESULTADOS_XLSX_PATH = Path(os.environ.get('RESULTADOS_XLSX_PATH', str(DATA_DIR / 'historico_calculos_chapas.xlsx')))
 PORTA_PADRAO = 8000
 APP_USER = os.environ.get('APP_USER', 'admin')
@@ -178,6 +188,228 @@ def atualizar_banco_pela_planilha():
     totais = importar(EXCEL_PATH, DB_PATH)
     garantir_tabelas_historico()
     return totais
+
+
+
+XLSX_NS = {'a': 'http://schemas.openxmlformats.org/spreadsheetml/2006/main', 'r': 'http://schemas.openxmlformats.org/officeDocument/2006/relationships'}
+
+
+def localizar_planilha_producao():
+    for caminho in PRODUCAO_CANDIDATOS:
+        if caminho.exists():
+            return caminho
+    return None
+
+
+def xlsx_coluna_para_numero(coluna):
+    n = 0
+    for letra in coluna:
+        n = n * 26 + ord(letra.upper()) - 64
+    return n
+
+
+def xlsx_shared_strings(z):
+    if 'xl/sharedStrings.xml' not in z.namelist():
+        return []
+    raiz = ET.fromstring(z.read('xl/sharedStrings.xml'))
+    saida = []
+    for si in raiz.findall('a:si', XLSX_NS):
+        saida.append(''.join(t.text or '' for t in si.findall('.//a:t', XLSX_NS)))
+    return saida
+
+
+def xlsx_mapa_abas(z):
+    workbook = ET.fromstring(z.read('xl/workbook.xml'))
+    rels = ET.fromstring(z.read('xl/_rels/workbook.xml.rels'))
+    relmap = {rel.attrib['Id']: rel.attrib['Target'] for rel in rels}
+    abas = {}
+    for aba in workbook.find('a:sheets', XLSX_NS):
+        nome = aba.attrib['name']
+        rid = aba.attrib['{http://schemas.openxmlformats.org/officeDocument/2006/relationships}id']
+        alvo = relmap[rid]
+        if alvo.startswith('/'):
+            alvo = alvo[1:]
+        elif not alvo.startswith('xl/'):
+            alvo = 'xl/' + alvo
+        abas[nome] = alvo
+    return abas
+
+
+def xlsx_valor_celula(celula, shared):
+    tipo = celula.attrib.get('t')
+    if tipo == 'inlineStr':
+        return ''.join(t.text or '' for t in celula.findall('.//a:t', XLSX_NS))
+    v = celula.find('a:v', XLSX_NS)
+    if v is None:
+        return ''
+    valor = v.text or ''
+    if tipo == 's':
+        try:
+            return shared[int(valor)]
+        except Exception:
+            return ''
+    if tipo == 'b':
+        try:
+            return bool(int(valor))
+        except Exception:
+            return False
+    try:
+        numero_valor = float(valor)
+        return int(numero_valor) if numero_valor.is_integer() else numero_valor
+    except Exception:
+        return valor
+
+
+def xlsx_ler_aba(arquivo, nome_aba):
+    arquivo = Path(arquivo)
+    with zipfile.ZipFile(arquivo) as z:
+        shared = xlsx_shared_strings(z)
+        abas = xlsx_mapa_abas(z)
+        alvo = None
+        for nome, caminho in abas.items():
+            if normalizar(nome) == normalizar(nome_aba):
+                alvo = caminho
+                break
+        if not alvo:
+            disponiveis = ', '.join(abas.keys())
+            raise ValueError(f'Aba {nome_aba} não encontrada na planilha. Abas disponíveis: {disponiveis}')
+        raiz = ET.fromstring(z.read(alvo))
+        linhas = {}
+        for c in raiz.findall('.//a:c', XLSX_NS):
+            ref = c.attrib.get('r', '')
+            m = re.match(r'([A-Z]+)(\d+)', ref)
+            if not m:
+                continue
+            col = xlsx_coluna_para_numero(m.group(1))
+            lin = int(m.group(2))
+            linhas.setdefault(lin, {})[col] = xlsx_valor_celula(c, shared)
+        return linhas
+
+
+def texto_lote(valor_lote):
+    if isinstance(valor_lote, (int, float)) and float(valor_lote).is_integer():
+        return str(int(valor_lote))
+    return str(valor_lote or '').strip()
+
+
+def limpar_produto_producao(produto):
+    produto = str(produto or '').strip()
+    produto = re.sub(r'^\s*\d+[\s\-–]+', '', produto)
+    produto = re.sub(r'\s+', ' ', produto).strip()
+    return produto
+
+
+def normalizar_flex(texto):
+    texto = normalizar(texto).replace(',', '').replace('.', '')
+    texto = re.sub(r'[^A-Z0-9]+', ' ', texto)
+    return re.sub(r'\s+', ' ', texto).strip()
+
+
+def resolver_produto_producao(produto_original, produtos_banco):
+    limpo = limpar_produto_producao(produto_original)
+    if not limpo:
+        return '', 'vazio'
+    n_limpo = normalizar(limpo)
+    flex_limpo = normalizar_flex(limpo)
+    mapa_norm = {normalizar(p): p for p in produtos_banco}
+    if n_limpo in mapa_norm:
+        return mapa_norm[n_limpo], 'exato'
+    for nome in produtos_banco:
+        n_nome = normalizar(nome)
+        if len(n_nome) >= 5 and (n_nome in n_limpo or n_limpo in n_nome):
+            return nome, 'contém'
+    melhor = None
+    melhor_score = 0
+    for nome in produtos_banco:
+        flex_nome = normalizar_flex(nome)
+        if not flex_nome:
+            continue
+        if flex_nome == flex_limpo:
+            return nome, 'flexível'
+        if len(flex_nome) >= 6 and flex_nome in flex_limpo:
+            score = 1.0 + len(flex_nome) / 10000
+        else:
+            tokens = [t for t in flex_nome.split() if len(t) > 1]
+            if not tokens:
+                continue
+            achados = sum(1 for t in tokens if t in flex_limpo)
+            score = achados / len(tokens)
+            if achados < 2:
+                score = 0
+        if score > melhor_score:
+            melhor_score = score
+            melhor = nome
+    if melhor and melhor_score >= 0.74:
+        return melhor, 'aproximado'
+    return limpo, 'não encontrado'
+
+
+def localizar_cabecalho_producao(linhas):
+    for lin in sorted(linhas)[:20]:
+        celulas = linhas.get(lin, {})
+        mapa = {normalizar(v): col for col, v in celulas.items() if str(v or '').strip()}
+        tem_lote = any('LOTE' == h or h.startswith('LOTE ') for h in mapa)
+        tem_produto = any('PRODUTO' == h or h.startswith('PRODUTO ') for h in mapa)
+        tem_qtde = any('QTDE' in h or 'QUANT' in h for h in mapa)
+        if tem_lote and tem_produto and tem_qtde:
+            def achar(*alvos):
+                for col, val in celulas.items():
+                    nv = normalizar(val)
+                    for alvo in alvos:
+                        if nv == alvo or alvo in nv:
+                            return col
+                return None
+            return {
+                'linha': lin,
+                'lote': achar('LOTE') or 1,
+                'produto': achar('PRODUTO') or 2,
+                'revestimento': achar('REVESTIMENTO') or 3,
+                'quantidade': achar('QTDE LOTE', 'QUANTIDADE') or 4,
+                'observacao': achar('OBSERVACAO', 'OBS') or 12,
+            }
+    return {'linha': 2, 'lote': 1, 'produto': 2, 'revestimento': 3, 'quantidade': 4, 'observacao': 12}
+
+
+def capturar_producao_dobue(lote_filtro=''):
+    caminho = localizar_planilha_producao()
+    if not caminho:
+        nomes = ', '.join(c.name for c in PRODUCAO_CANDIDATOS)
+        raise FileNotFoundError(f'Não encontrei a planilha de produção. Envie para o GitHub um destes nomes: {nomes}')
+    linhas = xlsx_ler_aba(caminho, ABA_PRODUCAO_DOBUE)
+    cab = localizar_cabecalho_producao(linhas)
+    produtos_banco = buscar_produtos()
+    filtro_norm = normalizar(lote_filtro)
+    detalhes = []
+    agregados = {}
+    max_linha = max(linhas.keys()) if linhas else 0
+    for lin in range(cab['linha'] + 1, max_linha + 1):
+        cel = linhas.get(lin, {})
+        lote = texto_lote(cel.get(cab['lote']))
+        produto_original = str(cel.get(cab['produto'], '') or '').strip()
+        qtd = numero(cel.get(cab['quantidade']))
+        if not lote and not produto_original and qtd == 0:
+            continue
+        if filtro_norm and normalizar(lote) != filtro_norm:
+            continue
+        if not produto_original or qtd <= 0:
+            continue
+        if re.fullmatch(r'\d+(\.0)?', produto_original.strip()):
+            continue
+        produto_limpo = limpar_produto_producao(produto_original)
+        produto_calculo, status = resolver_produto_producao(produto_original, produtos_banco)
+        encontrado = status != 'não encontrado' and status != 'vazio'
+        revest = str(cel.get(cab['revestimento'], '') or '').strip()
+        obs = str(cel.get(cab['observacao'], '') or '').strip()
+        detalhe = {'linha': lin, 'lote': lote, 'produto_original': produto_original, 'produto_limpo': produto_limpo, 'produto_calculo': produto_calculo, 'quantidade': qtd, 'revestimento': revest, 'observacao': obs, 'status': status, 'encontrado': encontrado}
+        detalhes.append(detalhe)
+        if encontrado:
+            chave = (lote, produto_calculo)
+            if chave not in agregados:
+                agregados[chave] = {'lote': lote, 'produto': produto_calculo, 'quantidade': 0.0}
+            agregados[chave]['quantidade'] += qtd
+    agregados_lista = sorted(agregados.values(), key=lambda x: (normalizar(x['lote']), normalizar(x['produto'])))
+    lotes_disponiveis = sorted({d['lote'] for d in detalhes if d.get('lote')}, key=lambda x: normalizar(x))
+    return {'arquivo': caminho, 'aba': ABA_PRODUCAO_DOBUE, 'cabecalho': cab, 'detalhes': detalhes, 'agregados': agregados_lista, 'lotes': lotes_disponiveis, 'total_linhas': len(detalhes), 'encontrados': sum(1 for d in detalhes if d['encontrado']), 'nao_encontrados': sum(1 for d in detalhes if not d['encontrado'])}
 
 
 
@@ -1008,7 +1240,9 @@ def lista_sequencia_chapa(chapa):
 
 
 def campos_hidden_lote(entradas, modo_corte='encaixe'):
-    html = [f'<input type="hidden" name="modo_corte" value="{escape(str(modo_corte))}">']
+    html = []
+    if modo_corte is not None:
+        html.append(f'<input type="hidden" name="modo_corte" value="{escape(str(modo_corte))}">')
     for item in entradas:
         html.append(f'<input type="hidden" name="lote" value="{escape(str(item.get("lote", "")))}">')
         html.append(f'<input type="hidden" name="produto" value="{escape(str(item.get("produto", item.get("produto_digitado", ""))))}">')
@@ -1331,7 +1565,7 @@ STYLE = r'''
 
 
 def layout(titulo, corpo):
-    return f'''<!doctype html><html lang="pt-br"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>{escape(titulo)}</title><link rel="stylesheet" href="/static/style.css"></head><body><div class="wrap"><div class="top"><div class="logo-header"><div class="logo-box"><img class="logo-principal" src="{LOGO_DOBUE_DATA}" alt="Dobuê Movelaria"></div><div class="brand"><h1>Consumo de chapas por lote</h1><p>Controle de lotes, consumo de chapas, histórico em Excel e plano de corte visual.</p><span class="page-title-chip">{escape(titulo)}</span></div></div><div class="nav"><a href="/">Calcular lote</a><a href="/planos_corte">Planos de corte</a><a href="/banco">Banco de dados</a><a href="/chapas">Configurar chapas</a><a href="/baixar_excel">Baixar histórico Excel</a></div></div>{corpo}<div class="footer">Software em Python. Plano de corte: encaixe retangular por tipo de chapa, rotação 90° permitida, kerf padrão de 4 mm.<div class="logos-rodape"><img class="logo-rodape" src="{LOGO_GRAUNA_DATA}" alt="Graúna Movelaria"><img class="logo-rodape simoni" src="{LOGO_SIMONI_VALERIO_DATA}" alt="Simoni & Valério"></div></div></div></body></html>'''
+    return f'''<!doctype html><html lang="pt-br"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>{escape(titulo)}</title><link rel="stylesheet" href="/static/style.css"></head><body><div class="wrap"><div class="top"><div class="logo-header"><div class="logo-box"><img class="logo-principal" src="{LOGO_DOBUE_DATA}" alt="Dobuê Movelaria"></div><div class="brand"><h1>Consumo de chapas por lote</h1><p>Controle de lotes, consumo de chapas, histórico em Excel e plano de corte visual.</p><span class="page-title-chip">{escape(titulo)}</span></div></div><div class="nav"><a href="/">Calcular lote</a><a href="/planos_corte">Planos de corte</a><a href="/producao_dobue">Produção DOBUÊ</a><a href="/banco">Banco de dados</a><a href="/chapas">Configurar chapas</a><a href="/baixar_excel">Baixar histórico Excel</a></div></div>{corpo}<div class="footer">Software em Python. Plano de corte: encaixe retangular por tipo de chapa, rotação 90° permitida, kerf padrão de 4 mm.<div class="logos-rodape"><img class="logo-rodape" src="{LOGO_GRAUNA_DATA}" alt="Graúna Movelaria"><img class="logo-rodape simoni" src="{LOGO_SIMONI_VALERIO_DATA}" alt="Simoni & Valério"></div></div></div></body></html>'''
 
 
 def tabela_resumo_chapas(resumo):
@@ -1362,6 +1596,63 @@ def tabela_detalhes(detalhes):
     return '<div class="table-wrap"><table><thead><tr><th>Lote</th><th>Produto</th><th>Código</th><th>Peça</th><th>Tipo chapa</th><th class="num">Comp.</th><th class="num">Larg.</th><th class="num">Esp.</th><th class="num">Qtde peça/prod.</th><th class="num">Qtde peças lote</th><th class="num">m² lote</th></tr></thead><tbody>' + ''.join(linhas) + '</tbody></table></div>'
 
 
+
+def tabela_producao_dobue(detalhes):
+    if not detalhes:
+        return '<p class="muted">Nenhuma linha encontrada na aba DOBUÊ para o filtro informado.</p>'
+    linhas = []
+    for d in detalhes[:500]:
+        status = 'OK' if d['encontrado'] else 'Não encontrado'
+        status_html = f'<span class="pill">{escape(status)} · {escape(d["status"])}</span>'
+        linhas.append(f'''<tr><td class="num">{d['linha']}</td><td>{escape(d['lote'])}</td><td>{escape(d['produto_original'])}</td><td>{escape(d['produto_calculo'])}</td><td class="num">{fmt_num(d['quantidade'])}</td><td>{escape(d['revestimento'])}</td><td>{status_html}</td></tr>''')
+    extra = ''
+    if len(detalhes) > 500:
+        extra = f'<p class="muted">Mostrando 500 de {len(detalhes)} linhas encontradas.</p>'
+    return extra + '<div class="table-wrap"><table><thead><tr><th class="num">Linha Excel</th><th>Lote</th><th>Produto na produção</th><th>Produto usado no cálculo</th><th class="num">Qtde</th><th>Revestimento</th><th>Status</th></tr></thead><tbody>' + ''.join(linhas) + '</tbody></table></div>'
+
+
+def tabela_agregados_dobue(agregados):
+    if not agregados:
+        return '<p class="muted">Nenhum item encontrado no banco para calcular. Confira os produtos não encontrados ou atualize a base de produtos.</p>'
+    linhas = []
+    for item in agregados:
+        linhas.append(f'''<tr><td>{escape(item['lote'])}</td><td>{escape(item['produto'])}</td><td class="num">{fmt_num(item['quantidade'])}</td></tr>''')
+    return '<div class="table-wrap"><table><thead><tr><th>Lote</th><th>Produto para cálculo</th><th class="num">Qtde total</th></tr></thead><tbody>' + ''.join(linhas) + '</tbody></table></div>'
+
+
+def render_producao_dobue(lote_filtro=''):
+    lote_filtro = str(lote_filtro or '').strip()
+    try:
+        dados = capturar_producao_dobue(lote_filtro)
+    except Exception as e:
+        corpo = f'''<div class="notice"><strong>Não foi possível capturar a produção DOBUÊ.</strong><br>{escape(str(e))}</div><div class="card"><h2>Como resolver</h2><p>Envie a planilha de produção para o GitHub na mesma pasta do <code>app.py</code> com um destes nomes:</p><pre>00-PRODUÇÃO GERAL 2026.xlsx\n00-PRODUCAO_GERAL_2026.xlsx\nproducao_geral_2026.xlsx</pre><p>Depois faça <strong>Manual Deploy &gt; Deploy latest commit</strong> no Render.</p></div>'''
+        return layout('Produção DOBUÊ', corpo)
+    hidden = campos_hidden_lote(dados['agregados'], None) if dados['agregados'] else ''
+    lotes = ''.join(f'<option value="{escape(l)}"></option>' for l in dados['lotes'])
+    aviso = ''
+    if dados['nao_encontrados']:
+        aviso = f'<div class="notice">{fmt_num(dados["nao_encontrados"])} linha(s) da produção DOBUÊ não encontraram ficha técnica no banco. Elas aparecem na tabela de conferência, mas não entram no cálculo automático.</div>'
+    acoes = ''
+    if dados['agregados']:
+        acoes = f'''<div class="actions"><form method="post" action="/calcular" style="display:inline">{hidden}<button class="btn" type="submit">Calcular consumo capturado</button></form><form method="post" action="/planos_corte" style="display:inline">{hidden}<select class="field" name="modo_corte" style="width:230px;display:inline-block"><option value="encaixe">Encaixe livre</option><option value="guilhotina">Guilhotina por faixas</option></select><button class="btn secondary" type="submit">Gerar plano de corte capturado</button></form></div>'''
+    corpo = f'''
+    <div class="card">
+        <h2>Capturar produção DOBUÊ automaticamente</h2>
+        <p class="muted">O sistema lê a aba <strong>{escape(dados['aba'])}</strong> da planilha <strong>{escape(dados['arquivo'].name)}</strong> e captura automaticamente: lote, produto e quantidade do lote. As outras empresas/abas são ignoradas.</p>
+        <form class="search" method="get" action="/producao_dobue">
+            <input class="field" name="lote" list="lotes-producao" placeholder="Filtrar por lote, exemplo: 9852" value="{escape(lote_filtro)}">
+            <datalist id="lotes-producao">{lotes}</datalist>
+            <button class="btn" type="submit">Capturar / atualizar</button>
+        </form>
+        <div class="actions"><a class="btn secondary" href="/producao_dobue">Mostrar todos os lotes DOBUÊ</a><a class="btn secondary" href="/">Voltar para cálculo manual</a></div>
+    </div>
+    <div class="card"><div class="grid"><div class="kpi"><span>Linhas DOBUÊ lidas</span><strong>{fmt_num(dados['total_linhas'])}</strong></div><div class="kpi"><span>Linhas encontradas no banco</span><strong>{fmt_num(dados['encontrados'])}</strong></div><div class="kpi"><span>Não encontradas</span><strong>{fmt_num(dados['nao_encontrados'])}</strong></div><div class="kpi"><span>Itens agregados para cálculo</span><strong>{fmt_num(len(dados['agregados']))}</strong></div><div class="kpi"><span>Aba usada</span><strong>DOBUÊ</strong></div></div></div>
+    {aviso}
+    <div class="card"><h2>Itens que entrarão no cálculo</h2>{tabela_agregados_dobue(dados['agregados'])}{acoes}</div>
+    <div class="card"><h2>Conferência das linhas capturadas</h2>{tabela_producao_dobue(dados['detalhes'])}</div>
+    '''
+    return layout('Produção DOBUÊ', corpo)
+
 def render_inicio(resultado=None, entradas=None):
     produtos = buscar_produtos()
     datalist = ''.join(f'<option value="{escape(p)}"></option>' for p in produtos)
@@ -1380,7 +1671,7 @@ def render_inicio(resultado=None, entradas=None):
             resultado_html = f'''{avisos}{excel}{sem}<div class="card"><div class="grid"><div class="kpi"><span>Produtos totais</span><strong>{fmt_num(t['produtos_totais'])}</strong></div><div class="kpi"><span>Produtos diferentes</span><strong>{fmt_num(t['produtos_diferentes'])}</strong></div><div class="kpi"><span>Itens produto/lote</span><strong>{fmt_num(t['linhas_produto_lote'])}</strong></div><div class="kpi"><span>m² total cortado</span><strong>{fmt_m2(t['m2_total'])}</strong></div><div class="kpi"><span>Chapas totais</span><strong>{fmt_num(t['chapas_total'])}</strong></div></div></div><div class="card"><h2>Chapas utilizadas por tipo</h2>{tabela_resumo_chapas(resultado['resumo'])}</div><div class="card"><h2>Resumo por produto e lote</h2>{tabela_produtos(resultado['produtos'])}</div><div class="card"><h2>Detalhamento das peças</h2>{tabela_detalhes(resultado['detalhes'])}</div>'''
         else:
             resultado_html = avisos or '<div class="notice">Informe pelo menos um produto válido para calcular.</div>'
-    corpo = f'''<div class="card"><h2>Entrada do lote</h2><p class="muted">Informe o número do lote, o produto agregado/completo e a quantidade que será produzida. Ao calcular, o sistema salva automaticamente o resultado no Excel de histórico.</p><form method="post" action="/calcular" id="form-lote"><datalist id="produtos-list">{datalist}</datalist><div id="linhas">{''.join(rows)}</div><div class="actions"><button type="button" class="btn secondary" onclick="adicionarLinha()">+ Adicionar produto</button><button type="submit" class="btn">Calcular e salvar no Excel</button><a class="btn secondary" href="/planos_corte">Gerar plano de corte</a><a class="btn secondary" href="/baixar_excel">Baixar histórico Excel</a><button type="button" class="btn secondary" onclick="window.print()">Imprimir / salvar PDF</button></div></form></div>{resultado_html}<script>function adicionarLinha(){{const div=document.createElement('div');div.className='form-row';div.innerHTML='<input name="lote" placeholder="Nº do lote"><input name="produto" list="produtos-list" placeholder="Digite ou selecione o produto"><input name="quantidade" type="text" inputmode="decimal" placeholder="Quantidade"><button type="button" class="btn secondary remove" onclick="removerLinha(this)">×</button>';document.getElementById('linhas').appendChild(div);}}function removerLinha(btn){{const linhas=document.querySelectorAll('.form-row');if(linhas.length>1)btn.parentElement.remove();}}</script>'''
+    corpo = f'''<div class="card"><h2>Entrada do lote</h2><p class="muted">Informe o número do lote, o produto agregado/completo e a quantidade que será produzida. Ao calcular, o sistema salva automaticamente o resultado no Excel de histórico.</p><form method="post" action="/calcular" id="form-lote"><datalist id="produtos-list">{datalist}</datalist><div id="linhas">{''.join(rows)}</div><div class="actions"><button type="button" class="btn secondary" onclick="adicionarLinha()">+ Adicionar produto</button><button type="submit" class="btn">Calcular e salvar no Excel</button><a class="btn secondary" href="/planos_corte">Gerar plano de corte</a><a class="btn secondary" href="/producao_dobue">Capturar produção DOBUÊ</a><a class="btn secondary" href="/baixar_excel">Baixar histórico Excel</a><button type="button" class="btn secondary" onclick="window.print()">Imprimir / salvar PDF</button></div></form></div>{resultado_html}<script>function adicionarLinha(){{const div=document.createElement('div');div.className='form-row';div.innerHTML='<input name="lote" placeholder="Nº do lote"><input name="produto" list="produtos-list" placeholder="Digite ou selecione o produto"><input name="quantidade" type="text" inputmode="decimal" placeholder="Quantidade"><button type="button" class="btn secondary remove" onclick="removerLinha(this)">×</button>';document.getElementById('linhas').appendChild(div);}}function removerLinha(btn){{const linhas=document.querySelectorAll('.form-row');if(linhas.length>1)btn.parentElement.remove();}}</script>'''
     return layout('Consumo de chapas por lote', corpo)
 
 
@@ -1497,6 +1788,8 @@ class App(BaseHTTPRequestHandler):
                 self.enviar(render_inicio())
             elif rota.path == '/planos_corte':
                 self.enviar(render_planos_corte())
+            elif rota.path == '/producao_dobue':
+                self.enviar(render_producao_dobue(params.get('lote', [''])[0]))
             elif rota.path == '/banco':
                 self.enviar(render_banco(params.get('q', [''])[0]))
             elif rota.path == '/atualizar_banco_excel':
