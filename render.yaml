@@ -1,0 +1,13 @@
+services:
+  - type: web
+    name: app-chapas
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: python app.py
+    envVars:
+      - key: AUTH_ENABLED
+        value: "1"
+      - key: APP_USER
+        value: admin
+      - key: APP_PASSWORD
+        sync: false
