@@ -18,7 +18,8 @@ BASE_DIR = Path(__file__).resolve().parent
 DATA_DIR = Path(os.environ.get('DATA_DIR', BASE_DIR))
 DB_PATH = Path(os.environ.get('DB_PATH', str(DATA_DIR / 'consumo_chapas.db')))
 SEED_DB_PATH = BASE_DIR / 'consumo_chapas.db'
-EXCEL_PATH = BASE_DIR / 'Consumo de chapa por lote.xlsx'
+EXCEL_CANDIDATOS = [BASE_DIR / 'Consumo_de_chapa_por_lote.xlsx', BASE_DIR / 'Consumo de chapa por lote.xlsx']
+EXCEL_PATH = next((c for c in EXCEL_CANDIDATOS if c.exists()), EXCEL_CANDIDATOS[0])
 RESULTADOS_XLSX_PATH = Path(os.environ.get('RESULTADOS_XLSX_PATH', str(DATA_DIR / 'historico_calculos_chapas.xlsx')))
 PORTA_PADRAO = 8000
 APP_USER = os.environ.get('APP_USER', 'admin')
@@ -161,6 +162,16 @@ def conectar():
     con = sqlite3.connect(DB_PATH)
     con.row_factory = sqlite3.Row
     return con
+
+def atualizar_banco_pela_planilha():
+    if not EXCEL_PATH.exists():
+        nomes = ', '.join(c.name for c in EXCEL_CANDIDATOS)
+        raise FileNotFoundError(f'Não encontrei a planilha no projeto. Envie um destes arquivos para o GitHub: {nomes}')
+    from importar_excel import importar
+    totais = importar(EXCEL_PATH, DB_PATH)
+    garantir_tabelas_historico()
+    return totais
+
 
 
 def buscar_produtos():
@@ -1372,7 +1383,7 @@ def render_banco(query=''):
     linhas = []
     for p in produtos:
         linhas.append(f'''<tr><td><a href="/pecas?produto={escape(p['nome'])}">{escape(p['nome'])}</a></td><td class="num">{fmt_num(p['pecas_unitarias'])}</td><td class="num">{fmt_m2(p['m2_unitario'])}</td><td>{escape(p['tipos_chapa_usados'] or '')}</td></tr>''')
-    corpo = f'''<div class="card"><div class="grid"><div class="kpi"><span>Produtos cadastrados</span><strong>{stats['produtos']}</strong></div><div class="kpi"><span>Peças cadastradas</span><strong>{stats['pecas']}</strong></div><div class="kpi"><span>Tipos de chapa</span><strong>{stats['chapas']}</strong></div><div class="kpi"><span>Banco</span><strong>SQLite</strong></div><div class="kpi"><span>Histórico</span><strong>Excel</strong></div></div></div><div class="card"><h2>Produtos do banco</h2><form class="search" method="get" action="/banco"><input class="field" name="q" placeholder="Buscar produto" value="{escape(query)}"><button class="btn" type="submit">Buscar</button></form><div class="table-wrap"><table><thead><tr><th>Produto</th><th class="num">Peças unit.</th><th class="num">m² unit.</th><th>Tipos de chapa usados</th></tr></thead><tbody>{''.join(linhas)}</tbody></table></div><p class="mini">Mostrando até 200 registros. Clique no nome do produto para ver a ficha de peças.</p></div>'''
+    corpo = f'''<div class="card"><div class="grid"><div class="kpi"><span>Produtos cadastrados</span><strong>{stats['produtos']}</strong></div><div class="kpi"><span>Peças cadastradas</span><strong>{stats['pecas']}</strong></div><div class="kpi"><span>Tipos de chapa</span><strong>{stats['chapas']}</strong></div><div class="kpi"><span>Banco</span><strong>SQLite</strong></div><div class="kpi"><span>Fonte produtos</span><strong>Aba LISTAS</strong></div></div></div><div class="card"><h2>Produtos do banco</h2><p class="muted">A lista de produtos deve vir da aba LISTAS da planilha. Se você atualizou a planilha no GitHub, clique no botão abaixo para atualizar o banco.</p><div class="actions"><a class="btn secondary" href="/atualizar_banco_excel">Atualizar banco pela planilha</a></div><form class="search" method="get" action="/banco"><input class="field" name="q" placeholder="Buscar produto" value="{escape(query)}"><button class="btn" type="submit">Buscar</button></form><div class="table-wrap"><table><thead><tr><th>Produto</th><th class="num">Peças unit.</th><th class="num">m² unit.</th><th>Tipos de chapa usados</th></tr></thead><tbody>{''.join(linhas)}</tbody></table></div><p class="mini">Mostrando até 200 registros. Clique no nome do produto para ver a ficha de peças.</p></div>'''
     return layout('Banco de dados', corpo)
 
 
@@ -1479,6 +1490,10 @@ class App(BaseHTTPRequestHandler):
                 self.enviar(render_planos_corte())
             elif rota.path == '/banco':
                 self.enviar(render_banco(params.get('q', [''])[0]))
+            elif rota.path == '/atualizar_banco_excel':
+                totais = atualizar_banco_pela_planilha()
+                msg = f'<div class="ok">Banco atualizado pela planilha {escape(EXCEL_PATH.name)}. Produtos: {totais[0]} | Peças: {totais[1]} | Tipos de chapa: {totais[2]}.</div><div class="actions"><a class="btn" href="/">Voltar para calcular lote</a><a class="btn secondary" href="/banco">Ver banco</a></div>'
+                self.enviar(layout('Banco atualizado', msg))
             elif rota.path == '/pecas':
                 self.enviar(render_pecas(params.get('produto', [''])[0]))
             elif rota.path == '/chapas':
