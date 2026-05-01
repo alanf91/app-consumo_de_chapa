@@ -674,10 +674,16 @@ def _prunar_livres(livres, min_dim=0.01):
     return sorted(saida, key=lambda r: (r["y"], r["x"], r["w"] * r["h"]))
 
 
+
+def _orientacoes_possiveis(peca, permite_girar):
+    opcoes = [(float(peca["w"]), float(peca["h"]), False)]
+    if permite_girar and abs(float(peca["w"]) - float(peca["h"])) > 1e-9:
+        opcoes.append((float(peca["h"]), float(peca["w"]), True))
+    return opcoes
+
+
 def escolher_orientacao(peca, rect, permite_girar):
-    opcoes = [(peca["w"], peca["h"], False)]
-    if permite_girar and abs(peca["w"] - peca["h"]) > 1e-9:
-        opcoes.append((peca["h"], peca["w"], True))
+    opcoes = _orientacoes_possiveis(peca, permite_girar)
     ok = [o for o in opcoes if o[0] <= rect["w"] + 1e-9 and o[1] <= rect["h"] + 1e-9]
     if not ok:
         return None
@@ -698,43 +704,120 @@ def _validar_chapa_sem_sobreposicao(chapa, chapa_w, chapa_h):
                 raise ValueError(f"Erro no plano: peças {p.get('codigo','')} e {q.get('codigo','')} ficaram sobrepostas.")
 
 
-def finalizar_chapas(chapas, chapa_w, chapa_h, modo):
+def finalizar_chapas(chapas, chapa_w, chapa_h, modo, estrategia=""):
     area = chapa_w * chapa_h
     for i, ch in enumerate(chapas, 1):
         _validar_chapa_sem_sobreposicao(ch, chapa_w, chapa_h)
-        a = sum(p["w_draw"] * p["h_draw"] for p in ch["pecas"])
+        a = sum(float(p["w_draw"]) * float(p["h_draw"]) for p in ch.get("pecas", []))
         aproveitamento = a / area if area else 0
         if aproveitamento > 1.0001:
-            raise ValueError(f"Erro no plano da chapa {i}: aproveitamento calculado acima de 100%. Revise medidas/algoritmo.")
+            raise ValueError(f"Erro no plano da chapa {i}: aproveitamento calculado acima de 100%.")
         ch.update({
             "numero": i,
             "area_pecas": a,
-            "aproveitamento": aproveitamento,
+            "aproveitamento": min(aproveitamento, 1.0),
             "sobra_m2": max(area - a, 0),
             "modo": modo,
+            "estrategia": estrategia,
             "chapa_w": chapa_w,
             "chapa_h": chapa_h,
         })
     return chapas
 
 
-def _colocar_peca_maxrects(ch, peca, chapa_w, chapa_h, kerf, permite_girar):
-    melhor = None
-    for rect in ch["livres"]:
-        ori = escolher_orientacao(peca, rect, permite_girar)
-        if not ori:
-            continue
-        w, h, girada = ori
-        sobra_w = rect["w"] - w
-        sobra_h = rect["h"] - h
-        score = (min(sobra_w, sobra_h), max(sobra_w, sobra_h), rect["w"] * rect["h"] - w * h)
-        if melhor is None or score < melhor[0]:
-            melhor = (score, rect, w, h, girada)
-    if melhor is None:
-        return False
+def _contato_score(ch, x, y, w, h, chapa_w, chapa_h):
+    score = 0.0
+    if abs(x) <= 1e-9:
+        score += h
+    if abs(y) <= 1e-9:
+        score += w
+    if abs((x + w) - chapa_w) <= 1e-9:
+        score += h
+    if abs((y + h) - chapa_h) <= 1e-9:
+        score += w
+    for q in ch.get("pecas", []):
+        qx, qy, qw, qh = q["x"], q["y"], q["w_draw"], q["h_draw"]
+        if abs(x - (qx + qw)) <= 1e-9 or abs((x + w) - qx) <= 1e-9:
+            score += max(0.0, min(y + h, qy + qh) - max(y, qy))
+        if abs(y - (qy + qh)) <= 1e-9 or abs((y + h) - qy) <= 1e-9:
+            score += max(0.0, min(x + w, qx + qw) - max(x, qx))
+    return score
 
-    _, rect, w, h, girada = melhor
-    x, y = rect["x"], rect["y"]
+
+def _pontuar_posicao(criterio, ch, rect, x, y, w, h, chapa_w, chapa_h):
+    sobra_w = rect["w"] - w
+    sobra_h = rect["h"] - h
+    sobra_area = rect["w"] * rect["h"] - w * h
+    short_side = min(sobra_w, sobra_h)
+    long_side = max(sobra_w, sobra_h)
+    contato = _contato_score(ch, x, y, w, h, chapa_w, chapa_h)
+    ocupacao_atual = sum(p["w_draw"] * p["h_draw"] for p in ch.get("pecas", []))
+    if criterio == "baf":
+        return (sobra_area, short_side, long_side, y, x)
+    if criterio == "bssf":
+        return (short_side, long_side, sobra_area, y, x)
+    if criterio == "blsf":
+        return (long_side, short_side, sobra_area, y, x)
+    if criterio == "contato":
+        return (-contato, sobra_area, short_side, y, x)
+    if criterio == "top_left":
+        return (y, x, short_side, sobra_area)
+    if criterio == "densidade":
+        return (-ocupacao_atual, sobra_area, short_side, y, x)
+    return (sobra_area, short_side, y, x)
+
+
+def _candidato_interfere_com_pecas(ch, x, y, w, h, kerf):
+    cand = {"x": x, "y": y, "w": w, "h": h}
+    for q in ch.get("pecas", []):
+        # folga de serra para direita/baixo coerente com o split dos espaços livres
+        occ = {"x": q["x"] - 1e-9, "y": q["y"] - 1e-9, "w": q["w_draw"] + kerf + 2e-9, "h": q["h_draw"] + kerf + 2e-9}
+        if _rect_intersect(cand, occ):
+            return True
+    return False
+
+
+def _melhor_posicao_maxrects(ch, peca, chapa_w, chapa_h, kerf, permite_girar, criterio):
+    melhor = None
+    for rect in ch.get("livres", []):
+        for w, h, girada in _orientacoes_possiveis(peca, permite_girar):
+            if w > rect["w"] + 1e-9 or h > rect["h"] + 1e-9:
+                continue
+            x, y = rect["x"], rect["y"]
+            if x + w > chapa_w + 1e-9 or y + h > chapa_h + 1e-9:
+                continue
+            if _candidato_interfere_com_pecas(ch, x, y, w, h, kerf):
+                continue
+            score = _pontuar_posicao(criterio, ch, rect, x, y, w, h, chapa_w, chapa_h)
+            cand = (score, rect, x, y, w, h, girada)
+            if melhor is None or cand[0] < melhor[0]:
+                melhor = cand
+    return melhor
+
+
+def _split_free_rectangles(livres, usado, min_dim):
+    novos = []
+    for fr in livres:
+        if not _rect_intersect(fr, usado):
+            novos.append(fr)
+            continue
+        fr_right = fr["x"] + fr["w"]
+        fr_bottom = fr["y"] + fr["h"]
+        us_right = usado["x"] + usado["w"]
+        us_bottom = usado["y"] + usado["h"]
+        if usado["x"] > fr["x"] + 1e-9:
+            novos.append({"x": fr["x"], "y": fr["y"], "w": usado["x"] - fr["x"], "h": fr["h"]})
+        if us_right < fr_right - 1e-9:
+            novos.append({"x": us_right, "y": fr["y"], "w": fr_right - us_right, "h": fr["h"]})
+        if usado["y"] > fr["y"] + 1e-9:
+            novos.append({"x": fr["x"], "y": fr["y"], "w": fr["w"], "h": usado["y"] - fr["y"]})
+        if us_bottom < fr_bottom - 1e-9:
+            novos.append({"x": fr["x"], "y": us_bottom, "w": fr["w"], "h": fr_bottom - us_bottom})
+    return _prunar_livres(novos, min_dim=min_dim)
+
+
+def _inserir_maxrects(ch, peca, pos, chapa_w, chapa_h, kerf):
+    _, rect, x, y, w, h, girada = pos
     p = dict(peca)
     p.update({"x": x, "y": y, "w_draw": w, "h_draw": h, "girada": girada})
     ch["pecas"].append(p)
@@ -742,72 +825,83 @@ def _colocar_peca_maxrects(ch, peca, chapa_w, chapa_h, kerf, permite_girar):
         f"Encaixar código {p['codigo']} em X={int(round(x*1000))} mm / Y={int(round(y*1000))} mm, "
         f"medida {int(round(w*1000))} x {int(round(h*1000))} mm."
     )
-
-    # O retângulo ocupado inclui a perda de serra para criar distância entre peças.
-    # Na borda da chapa não é necessário reservar kerf para fora da chapa.
-    occ = {
-        "x": x,
-        "y": y,
-        "w": min(w + kerf, chapa_w - x),
-        "h": min(h + kerf, chapa_h - y),
-    }
-
-    novos_livres = []
-    for fr in ch["livres"]:
-        if not _rect_intersect(fr, occ):
-            novos_livres.append(fr)
-            continue
-
-        if occ["x"] > fr["x"] + 1e-9:
-            novos_livres.append({"x": fr["x"], "y": fr["y"], "w": occ["x"] - fr["x"], "h": fr["h"]})
-        fr_right = fr["x"] + fr["w"]
-        occ_right = occ["x"] + occ["w"]
-        if occ_right < fr_right - 1e-9:
-            novos_livres.append({"x": occ_right, "y": fr["y"], "w": fr_right - occ_right, "h": fr["h"]})
-        if occ["y"] > fr["y"] + 1e-9:
-            novos_livres.append({"x": fr["x"], "y": fr["y"], "w": fr["w"], "h": occ["y"] - fr["y"]})
-        fr_bottom = fr["y"] + fr["h"]
-        occ_bottom = occ["y"] + occ["h"]
-        if occ_bottom < fr_bottom - 1e-9:
-            novos_livres.append({"x": fr["x"], "y": occ_bottom, "w": fr["w"], "h": fr_bottom - occ_bottom})
-
-    ch["livres"] = _prunar_livres(novos_livres, min_dim=max(kerf, 0.005))
-    return True
+    usado = {"x": x, "y": y, "w": min(w + kerf, chapa_w - x), "h": min(h + kerf, chapa_h - y)}
+    ch["livres"] = _split_free_rectangles(ch.get("livres", []), usado, min_dim=max(kerf, 0.003))
 
 
-def plano_encaixe_livre(pecas, chapa_w, chapa_h, kerf, permite_girar):
-    """Plano por encaixe livre com MaxRects simplificado e validação anti-sobreposição.
+def _ordenar_pecas(pecas, ordenacao):
+    if ordenacao == "area_desc":
+        return sorted(pecas, key=lambda p: (p["w"] * p["h"], max(p["w"], p["h"]), min(p["w"], p["h"])), reverse=True)
+    if ordenacao == "lado_maior_desc":
+        return sorted(pecas, key=lambda p: (max(p["w"], p["h"]), p["w"] * p["h"]), reverse=True)
+    if ordenacao == "largura_desc":
+        return sorted(pecas, key=lambda p: (p["w"], p["h"], p["w"] * p["h"]), reverse=True)
+    if ordenacao == "altura_desc":
+        return sorted(pecas, key=lambda p: (p["h"], p["w"], p["w"] * p["h"]), reverse=True)
+    if ordenacao == "perimetro_desc":
+        return sorted(pecas, key=lambda p: (p["w"] + p["h"], p["w"] * p["h"]), reverse=True)
+    if ordenacao == "quadradas_primeiro":
+        return sorted(pecas, key=lambda p: (abs(p["w"] - p["h"]), -(p["w"] * p["h"])))
+    if ordenacao == "estreitas_depois":
+        return sorted(pecas, key=lambda p: (min(p["w"], p["h"]), p["w"] * p["h"]), reverse=True)
+    return list(pecas)
 
-    Corrige o problema de aproveitamento acima de 100% causado por retângulos
-    livres sobrepostos na versão anterior.
-    """
-    pecas = sorted(pecas, key=lambda p: (p["w"] * p["h"], max(p["w"], p["h"])), reverse=True)
+
+def _chapa_vazia(chapa_w, chapa_h):
+    return {"pecas": [], "livres": [{"x": 0.0, "y": 0.0, "w": chapa_w, "h": chapa_h}], "sequencia": []}
+
+
+def _plano_maxrects_estrategia(pecas, chapa_w, chapa_h, kerf, permite_girar, ordenacao, criterio):
+    ordenadas = _ordenar_pecas(pecas, ordenacao)
     chapas = []
-
-    def nova_chapa():
-        return {"pecas": [], "livres": [{"x": 0.0, "y": 0.0, "w": chapa_w, "h": chapa_h}], "sequencia": []}
-
-    for peca in pecas:
+    for peca in ordenadas:
         if not escolher_orientacao(peca, {"x": 0.0, "y": 0.0, "w": chapa_w, "h": chapa_h}, permite_girar):
             raise ValueError(f"Peça código {peca['codigo']} não cabe na chapa {int(chapa_w*1000)} x {int(chapa_h*1000)} mm.")
-
-        colocado = False
-        for ch in chapas:
-            if _colocar_peca_maxrects(ch, peca, chapa_w, chapa_h, kerf, permite_girar):
-                colocado = True
-                break
-        if not colocado:
-            ch = nova_chapa()
-            _colocar_peca_maxrects(ch, peca, chapa_w, chapa_h, kerf, permite_girar)
-            ch["sequencia"].insert(0, "Abrir nova chapa.")
+        melhor_chapa = None
+        melhor_pos = None
+        for idx, ch in enumerate(chapas):
+            pos = _melhor_posicao_maxrects(ch, peca, chapa_w, chapa_h, kerf, permite_girar, criterio)
+            if pos is None:
+                continue
+            score_global = (idx, pos[0])
+            if melhor_pos is None or score_global < melhor_pos[0]:
+                melhor_pos = (score_global, pos)
+                melhor_chapa = ch
+        if melhor_chapa is None:
+            ch = _chapa_vazia(chapa_w, chapa_h)
+            pos = _melhor_posicao_maxrects(ch, peca, chapa_w, chapa_h, kerf, permite_girar, criterio)
+            if pos is None:
+                raise ValueError(f"Peça código {peca['codigo']} não cabe na chapa {int(chapa_w*1000)} x {int(chapa_h*1000)} mm.")
+            ch["sequencia"].append("Abrir nova chapa.")
+            _inserir_maxrects(ch, peca, pos, chapa_w, chapa_h, kerf)
             chapas.append(ch)
+        else:
+            _inserir_maxrects(melhor_chapa, peca, melhor_pos[1], chapa_w, chapa_h, kerf)
+    return finalizar_chapas(chapas, chapa_w, chapa_h, "encaixe", f"MaxRects {criterio} / {ordenacao}")
 
-    return finalizar_chapas(chapas, chapa_w, chapa_h, "encaixe")
 
+def _plano_shelf_estrategia(pecas, chapa_w, chapa_h, kerf, permite_girar, ordenacao, orientacao_faixas="horizontal"):
+    if orientacao_faixas == "vertical":
+        pecas_swap = []
+        for p in pecas:
+            pp = dict(p)
+            pp["w"], pp["h"] = p["h"], p["w"]
+            pecas_swap.append(pp)
+        chapas_swap = _plano_shelf_estrategia(pecas_swap, chapa_h, chapa_w, kerf, permite_girar, ordenacao, "horizontal")
+        chapas = []
+        for ch in chapas_swap:
+            novo = {"pecas": [], "faixas": ch.get("faixas", []), "sequencia": ["Plano guilhotinado vertical convertido para orientação da chapa."] + ch.get("sequencia", [])}
+            for p in ch["pecas"]:
+                q = dict(p)
+                old_x, old_y, old_w, old_h = p["x"], p["y"], p["w_draw"], p["h_draw"]
+                q["x"], q["y"], q["w_draw"], q["h_draw"] = old_y, old_x, old_h, old_w
+                novo["pecas"].append(q)
+            chapas.append(novo)
+        return finalizar_chapas(chapas, chapa_w, chapa_h, "guilhotina", f"Faixas verticais / {ordenacao}")
 
-def plano_guilhotina_faixas(pecas, chapa_w, chapa_h, kerf, permite_girar):
-    pecas = sorted(pecas, key=lambda p: (p["w"] * p["h"], max(p["w"], p["h"])), reverse=True)
-    chapas, ch = [], {"pecas": [], "faixas": [], "sequencia": []}
+    ordenadas = _ordenar_pecas(pecas, ordenacao)
+    chapas = []
+    ch = {"pecas": [], "faixas": [], "sequencia": []}
 
     def iniciar_faixa(ch, y, h):
         faixa = {"y": y, "h": h, "x": 0.0, "pecas": []}
@@ -815,29 +909,25 @@ def plano_guilhotina_faixas(pecas, chapa_w, chapa_h, kerf, permite_girar):
         ch["sequencia"].append(f"Cortar faixa guilhotinada de {int(round(h*1000))} mm a partir de Y={int(round(y*1000))} mm.")
         return faixa
 
-    for peca in pecas:
-        colocado = False
+    for peca in ordenadas:
+        melhor = None
         for faixa in ch["faixas"]:
-            opcoes = [(peca["w"], peca["h"], False)]
-            if permite_girar and abs(peca["w"] - peca["h"]) > 1e-9:
-                opcoes.append((peca["h"], peca["w"], True))
-            opcoes = [o for o in opcoes if o[1] <= faixa["h"] + 1e-9 and faixa["x"] + o[0] <= chapa_w + 1e-9]
-            if opcoes:
-                w, h, girada = min(opcoes, key=lambda o: (faixa["h"] - o[1], chapa_w - (faixa["x"] + o[0])))
-                x = faixa["x"]
-                p = dict(peca); p.update({"x": x, "y": faixa["y"], "w_draw": w, "h_draw": h, "girada": girada})
-                ch["pecas"].append(p); faixa["pecas"].append(p)
-                faixa["x"] = x + w + kerf
-                ch["sequencia"].append(f"Na faixa {int(round(faixa['h']*1000))} mm, cortar código {p['codigo']} com {int(round(w*1000))} x {int(round(h*1000))} mm.")
-                colocado = True
-                break
-        if colocado:
+            for w, h, girada in _orientacoes_possiveis(peca, permite_girar):
+                if h <= faixa["h"] + 1e-9 and faixa["x"] + w <= chapa_w + 1e-9:
+                    score = (faixa["h"] - h, chapa_w - (faixa["x"] + w), faixa["y"])
+                    cand = (score, faixa, w, h, girada)
+                    if melhor is None or cand[0] < melhor[0]:
+                        melhor = cand
+        if melhor is not None:
+            _, faixa, w, h, girada = melhor
+            x = faixa["x"]
+            p = dict(peca); p.update({"x": x, "y": faixa["y"], "w_draw": w, "h_draw": h, "girada": girada})
+            ch["pecas"].append(p); faixa["pecas"].append(p)
+            faixa["x"] = x + w + kerf
+            ch["sequencia"].append(f"Na faixa {int(round(faixa['h']*1000))} mm, cortar código {p['codigo']} com {int(round(w*1000))} x {int(round(h*1000))} mm.")
             continue
 
-        opcoes_nova = [(peca["w"], peca["h"], False)]
-        if permite_girar and abs(peca["w"] - peca["h"]) > 1e-9:
-            opcoes_nova.append((peca["h"], peca["w"], True))
-        opcoes_nova = [o for o in opcoes_nova if o[0] <= chapa_w + 1e-9 and o[1] <= chapa_h + 1e-9]
+        opcoes_nova = [(w, h, girada) for w, h, girada in _orientacoes_possiveis(peca, permite_girar) if w <= chapa_w + 1e-9 and h <= chapa_h + 1e-9]
         if not opcoes_nova:
             raise ValueError(f"Peça código {peca['codigo']} não cabe na chapa {int(chapa_w*1000)} x {int(chapa_h*1000)} mm.")
         w, h, girada = min(opcoes_nova, key=lambda o: (o[1], -o[0]))
@@ -856,7 +946,91 @@ def plano_guilhotina_faixas(pecas, chapa_w, chapa_h, kerf, permite_girar):
         ch["sequencia"].append(f"Na nova faixa, cortar código {p['codigo']} com {int(round(w*1000))} x {int(round(h*1000))} mm.")
     if ch["pecas"]:
         chapas.append(ch)
-    return finalizar_chapas(chapas, chapa_w, chapa_h, "guilhotina")
+    return finalizar_chapas(chapas, chapa_w, chapa_h, "guilhotina", f"Faixas horizontais / {ordenacao}")
+
+
+def _score_plano(chapas, chapa_w, chapa_h):
+    area_chapa = chapa_w * chapa_h
+    qtd = len(chapas)
+    area_total = sum(ch.get("area_pecas", 0.0) for ch in chapas)
+    aproveitamento_geral = area_total / (qtd * area_chapa) if qtd and area_chapa else 0.0
+    pior_chapa = min((ch.get("aproveitamento", 0.0) for ch in chapas), default=0.0)
+    return (qtd, -aproveitamento_geral, -pior_chapa)
+
+
+def _selecionar_melhor_plano(candidatos, chapa_w, chapa_h):
+    candidatos = [c for c in candidatos if c]
+    if not candidatos:
+        return []
+    return min(candidatos, key=lambda chapas: _score_plano(chapas, chapa_w, chapa_h))
+
+
+def _metadados_plano(chapas, chapa_w, chapa_h, meta=META_APROVEITAMENTO_PADRAO):
+    area_chapa = chapa_w * chapa_h
+    area_total = sum(ch.get("area_pecas", 0.0) for ch in chapas)
+    qtd = len(chapas)
+    aproveitamento = area_total / (qtd * area_chapa) if qtd and area_chapa else 0.0
+    chapas_min_area = math.ceil(area_total / area_chapa) if area_chapa and area_total > 0 else 0
+    limite_teorico_area = area_total / (chapas_min_area * area_chapa) if chapas_min_area and area_chapa else 0.0
+    return {
+        "chapas_total": qtd,
+        "area_total_pecas": area_total,
+        "aproveitamento_geral": aproveitamento,
+        "sobra_total_m2": max(qtd * area_chapa - area_total, 0.0),
+        "meta_alvo": meta,
+        "meta_atingida": aproveitamento >= meta - 1e-9,
+        "chapas_min_area": chapas_min_area,
+        "limite_teorico_area": limite_teorico_area,
+    }
+
+
+def plano_encaixe_livre(pecas, chapa_w, chapa_h, kerf, permite_girar):
+    """Encaixe livre otimizado por múltiplas estratégias MaxRects."""
+    ordenacoes = ["area_desc", "lado_maior_desc", "largura_desc", "altura_desc", "perimetro_desc", "estreitas_depois", "quadradas_primeiro"]
+    criterios = ["baf", "bssf", "blsf", "contato", "top_left", "densidade"]
+    candidatos = []
+    erros = []
+    for ordenacao in ordenacoes:
+        for criterio in criterios:
+            try:
+                candidatos.append(_plano_maxrects_estrategia(pecas, chapa_w, chapa_h, kerf, permite_girar, ordenacao, criterio))
+            except Exception as exc:
+                erros.append(str(exc))
+    if not candidatos and erros:
+        raise ValueError(erros[-1])
+    return _selecionar_melhor_plano(candidatos, chapa_w, chapa_h)
+
+
+def plano_guilhotina_faixas(pecas, chapa_w, chapa_h, kerf, permite_girar):
+    """Plano guilhotinado por faixas com várias ordenações e direções."""
+    ordenacoes = ["area_desc", "lado_maior_desc", "largura_desc", "altura_desc", "perimetro_desc", "estreitas_depois"]
+    candidatos = []
+    erros = []
+    for ordenacao in ordenacoes:
+        for orientacao in ["horizontal", "vertical"]:
+            try:
+                candidatos.append(_plano_shelf_estrategia(pecas, chapa_w, chapa_h, kerf, permite_girar, ordenacao, orientacao))
+            except Exception as exc:
+                erros.append(str(exc))
+    if not candidatos and erros:
+        raise ValueError(erros[-1])
+    return _selecionar_melhor_plano(candidatos, chapa_w, chapa_h)
+
+
+def plano_otimizado_meta95(pecas, chapa_w, chapa_h, kerf, permite_girar):
+    """Escolhe automaticamente entre encaixe livre e guilhotina, mirando 95%."""
+    candidatos = []
+    for fn in (plano_encaixe_livre, plano_guilhotina_faixas):
+        try:
+            candidatos.append(fn(pecas, chapa_w, chapa_h, kerf, permite_girar))
+        except Exception:
+            pass
+    if not candidatos:
+        return plano_encaixe_livre(pecas, chapa_w, chapa_h, kerf, permite_girar)
+    melhor = _selecionar_melhor_plano(candidatos, chapa_w, chapa_h)
+    for ch in melhor:
+        ch["modo"] = "otimizado"
+    return melhor
 
 
 def gerar_planos(itens, resumo, modo):
@@ -869,10 +1043,24 @@ def gerar_planos(itens, resumo, modo):
         chapa_w, chapa_h = float(r["comprimento_chapa"]), float(r["largura_chapa"])
         kerf = float(r["kerf_mm"]) / 1000.0
         permite = bool(r["permite_girar"])
-        chapas = plano_guilhotina_faixas(pecas, chapa_w, chapa_h, kerf, permite) if modo == "guilhotina" else plano_encaixe_livre(pecas, chapa_w, chapa_h, kerf, permite)
-        planos.append({"material": material, "chapas": chapas, "modo": modo})
-    return planos
 
+        if modo == "guilhotina":
+            chapas = plano_guilhotina_faixas(pecas, chapa_w, chapa_h, kerf, permite)
+        elif modo == "encaixe":
+            chapas = plano_encaixe_livre(pecas, chapa_w, chapa_h, kerf, permite)
+        else:
+            chapas = plano_otimizado_meta95(pecas, chapa_w, chapa_h, kerf, permite)
+
+        meta = _metadados_plano(chapas, chapa_w, chapa_h)
+        estrategia = chapas[0].get("estrategia", "") if chapas else ""
+        planos.append({
+            "material": material,
+            "chapas": chapas,
+            "modo": modo,
+            "estrategia": estrategia,
+            **meta,
+        })
+    return planos
 
 def salvar_historico(entradas, itens, resumo, desconhecidos, modo):
     with conectar() as conn:
@@ -951,7 +1139,7 @@ def gerar_xlsx_historico():
 # ============================================================
 
 CSS = """
-:root{--bg:#f3f6fb;--card:#fff;--text:#0f1f35;--muted:#53657e;--blue:#1f5eea;--border:#dfe6f0;--danger:#b42318;--ok:#027a48}*{box-sizing:border-box}body{font-family:Arial,Helvetica,sans-serif;margin:0;background:var(--bg);color:var(--text)}.wrap{max-width:1220px;margin:0 auto;padding:20px}.header{display:flex;align-items:center;gap:20px;margin-bottom:18px}.logo-main{height:78px;max-width:260px;object-fit:contain}.header h1{font-size:26px;margin:0 0 4px}.header p{margin:0;color:var(--muted)}.nav{display:flex;gap:10px;flex-wrap:wrap;margin-bottom:18px}.nav a,.btn{display:inline-flex;align-items:center;justify-content:center;border:1px solid var(--border);background:#fff;color:#064ceb;text-decoration:none;border-radius:10px;padding:10px 14px;font-weight:700;cursor:pointer;font-size:14px}.btn.primary{background:var(--blue);color:#fff;border-color:var(--blue)}.card{background:var(--card);border:1px solid var(--border);border-radius:18px;padding:18px;margin:14px 0;box-shadow:0 8px 24px rgba(17,33,61,.06)}.card h2{margin:0 0 16px;font-size:24px}.hint{color:var(--muted);font-size:14px}.row{display:grid;grid-template-columns:180px 1fr 160px 48px;gap:10px;margin:8px 0}.row2{display:grid;grid-template-columns:1fr 1fr 1fr;gap:12px}input,select,textarea{width:100%;border:1px solid var(--border);border-radius:10px;padding:11px 12px;font-size:14px;background:#fff}textarea{min-height:260px;resize:vertical;font-family:Consolas,Menlo,monospace;line-height:1.45}.paste-grid{display:grid;grid-template-columns:1fr 180px;gap:12px;margin-top:12px}.paste-grid label{display:block;font-weight:800;margin:0 0 7px}.minihelp{background:#f8fafc;border:1px dashed var(--border);border-radius:12px;padding:10px 12px;margin:10px 0;color:#53657e;font-size:13px}.counter{font-size:13px;color:#53657e;margin-top:6px}.toolbar{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-top:10px}table{width:100%;border-collapse:separate;border-spacing:0;border:1px solid var(--border);border-radius:12px;overflow:hidden;background:#fff}th,td{padding:10px 12px;border-bottom:1px solid var(--border);text-align:left;font-size:14px;vertical-align:top}th{background:#f8fafc;font-weight:800}tr:last-child td{border-bottom:none}.num{text-align:right}.badge{display:inline-block;border-radius:999px;background:#eef2ff;color:#123cbd;padding:4px 8px;font-size:12px}.badge.danger{background:#fee4e2;color:#b42318}.badge.ok{background:#d1fadf;color:#027a48}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:12px}.stat{background:#f8fafc;border:1px solid var(--border);border-radius:14px;padding:14px}.stat b{font-size:24px}.actions{display:flex;gap:10px;flex-wrap:wrap;margin-top:12px}.footer{display:flex;justify-content:center;align-items:center;gap:26px;margin:26px auto 10px;flex-wrap:wrap}.footer img{height:58px;max-width:230px;object-fit:contain;filter:grayscale(.1);opacity:.88}.sheet-card{page-break-inside:avoid}.svgwrap{overflow:auto;border:1px solid var(--border);border-radius:12px;background:#fff;padding:8px}.cutseq{font-size:13px;color:#334155;columns:2}.login{max-width:430px;margin:80px auto}@media (max-width:760px){.paste-grid{grid-template-columns:1fr}.row2{grid-template-columns:1fr}}@media print{.nav,.actions,.no-print,.btn{display:none!important}.wrap{max-width:100%;padding:0}.card{box-shadow:none;border:1px solid #999;page-break-inside:avoid}body{background:#fff}}
+:root{--bg:#f3f6fb;--card:#fff;--text:#0f1f35;--muted:#53657e;--blue:#1f5eea;--border:#dfe6f0;--danger:#b42318;--ok:#027a48}*{box-sizing:border-box}body{font-family:Arial,Helvetica,sans-serif;margin:0;background:var(--bg);color:var(--text)}.wrap{max-width:1220px;margin:0 auto;padding:20px}.header{display:flex;align-items:center;gap:20px;margin-bottom:18px}.logo-main{height:78px;max-width:260px;object-fit:contain}.header h1{font-size:26px;margin:0 0 4px}.header p{margin:0;color:var(--muted)}.nav{display:flex;gap:10px;flex-wrap:wrap;margin-bottom:18px}.nav a,.btn{display:inline-flex;align-items:center;justify-content:center;border:1px solid var(--border);background:#fff;color:#064ceb;text-decoration:none;border-radius:10px;padding:10px 14px;font-weight:700;cursor:pointer;font-size:14px}.btn.primary{background:var(--blue);color:#fff;border-color:var(--blue)}.card{background:var(--card);border:1px solid var(--border);border-radius:18px;padding:18px;margin:14px 0;box-shadow:0 8px 24px rgba(17,33,61,.06)}.card h2{margin:0 0 16px;font-size:24px}.hint{color:var(--muted);font-size:14px}.row{display:grid;grid-template-columns:180px 1fr 160px 48px;gap:10px;margin:8px 0}.row2{display:grid;grid-template-columns:1fr 1fr 1fr;gap:12px}input,select,textarea{width:100%;border:1px solid var(--border);border-radius:10px;padding:11px 12px;font-size:14px;background:#fff}textarea{min-height:260px;resize:vertical;font-family:Consolas,Menlo,monospace;line-height:1.45}.paste-grid{display:grid;grid-template-columns:1fr 180px;gap:12px;margin-top:12px}.paste-grid label{display:block;font-weight:800;margin:0 0 7px}.minihelp{background:#f8fafc;border:1px dashed var(--border);border-radius:12px;padding:10px 12px;margin:10px 0;color:#53657e;font-size:13px}.counter{font-size:13px;color:#53657e;margin-top:6px}.toolbar{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-top:10px}table{width:100%;border-collapse:separate;border-spacing:0;border:1px solid var(--border);border-radius:12px;overflow:hidden;background:#fff}th,td{padding:10px 12px;border-bottom:1px solid var(--border);text-align:left;font-size:14px;vertical-align:top}th{background:#f8fafc;font-weight:800}tr:last-child td{border-bottom:none}.num{text-align:right}.badge{display:inline-block;border-radius:999px;background:#eef2ff;color:#123cbd;padding:4px 8px;font-size:12px}.badge.danger{background:#fee4e2;color:#b42318}.badge.ok{background:#d1fadf;color:#027a48}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:12px}.stat{background:#f8fafc;border:1px solid var(--border);border-radius:14px;padding:14px}.stat b{font-size:24px}.actions{display:flex;gap:10px;flex-wrap:wrap;margin-top:12px}.footer{display:flex;justify-content:center;align-items:center;gap:26px;margin:26px auto 10px;flex-wrap:wrap}.footer img{height:58px;max-width:230px;object-fit:contain;filter:grayscale(.1);opacity:.88}.sheet-card{page-break-inside:avoid}.svgwrap{overflow:auto;border:1px solid var(--border);border-radius:12px;background:#fff;padding:8px}.cut-svg{display:block;width:100%;height:auto;max-height:720px;background:#fff}.cutseq{font-size:13px;color:#334155;columns:2}.login{max-width:430px;margin:80px auto}@media (max-width:760px){.paste-grid{grid-template-columns:1fr}.row2{grid-template-columns:1fr}}@media print{.nav,.actions,.no-print,.btn{display:none!important}.wrap{max-width:100%;padding:0}.card{box-shadow:none;border:1px solid #999;page-break-inside:avoid}body{background:#fff}}
 """
 
 
@@ -987,7 +1175,7 @@ def pagina_corte(result_html=""):
         </div>
         <div class="toolbar no-print"><button type="button" class="btn" onclick="limparEntrada()">Limpar entrada</button><button type="button" class="btn" onclick="exemploEntrada()">Preencher exemplo</button></div>
         {datalist_codigos()}
-        <div class="row2" style="margin-top:12px"><div><label class="hint">Tipo de plano de corte</label><select name="modo_corte"><option value="encaixe">Encaixe livre</option><option value="guilhotina">Guilhotina por faixas</option></select></div><div><label class="hint">Salvar histórico</label><select name="salvar_historico"><option value="1">Sim</option><option value="0">Não</option></select></div><div><label class="hint">Ação</label><select name="acao"><option value="calcular">Apenas calcular consumo</option><option value="plano">Calcular e gerar plano de corte</option></select></div></div>
+        <div class="row2" style="margin-top:12px"><div><label class="hint">Tipo de plano de corte</label><select name="modo_corte"><option value="otimizado">Otimizado automático 95%</option><option value="encaixe">Encaixe livre otimizado</option><option value="guilhotina">Guilhotina por faixas</option></select></div><div><label class="hint">Salvar histórico</label><select name="salvar_historico"><option value="1">Sim</option><option value="0">Não</option></select></div><div><label class="hint">Ação</label><select name="acao"><option value="calcular">Apenas calcular consumo</option><option value="plano">Calcular e gerar plano de corte</option></select></div></div>
         <div class="actions"><button class="btn primary" type="submit">Executar</button><button type="button" class="btn" onclick="window.print()">Imprimir / salvar PDF</button></div>
     </form>{result_html}
     <script>
@@ -1113,32 +1301,80 @@ def entradas_do_formulario(form):
 
     return entradas
 
+
 def svg_chapa(chapa):
+    """Desenha a chapa em SVG usando milímetros como unidade do viewBox.
+
+    Isso corrige a aparência torta causada por escalas fracionadas e prende
+    o texto dentro de cada retângulo.
+    """
     chapa_w, chapa_h = chapa.get("chapa_w", 2.75), chapa.get("chapa_h", 1.85)
-    W, H = 980, max(260, int(980 * chapa_h / chapa_w))
-    def sx(x): return x / chapa_w * W
-    def sy(y): return y / chapa_h * H
-    parts = [f'<svg width="100%" viewBox="0 0 {W} {H}" xmlns="http://www.w3.org/2000/svg"><rect x="0" y="0" width="{W}" height="{H}" fill="#fff" stroke="#111827" stroke-width="2"/>']
-    for p in chapa["pecas"]:
-        x, y, w, h = sx(p["x"]), sy(p["y"]), sx(p["w_draw"]), sy(p["h_draw"])
-        label = f"{p['codigo']} | {int(round(p['w_draw']*1000))}x{int(round(p['h_draw']*1000))}"
-        fs = max(8, min(16, int(min(w/8, h/3))))
-        parts.append(f'<rect x="{x:.2f}" y="{y:.2f}" width="{w:.2f}" height="{h:.2f}" fill="{cor_hash(p["codigo"])}" stroke="#334155" stroke-width="1"/><text x="{x+4:.2f}" y="{y+fs+4:.2f}" font-size="{fs}" font-family="Arial" fill="#111827">{html_escape(label)}</text>')
+    W = int(round(chapa_w * 1000))
+    H = int(round(chapa_h * 1000))
+    sid = f"s{chapa.get('numero', 0)}_{abs(hash(str(chapa.get('estrategia','')))) % 99999}"
+    parts = [
+        f'<svg class="cut-svg" viewBox="0 0 {W} {H}" xmlns="http://www.w3.org/2000/svg" preserveAspectRatio="xMinYMin meet" shape-rendering="crispEdges">',
+        f'<rect x="0" y="0" width="{W}" height="{H}" fill="#fff" stroke="#111827" stroke-width="4"/>',
+    ]
+    for i, p in enumerate(chapa.get("pecas", [])):
+        x = int(round(float(p["x"]) * 1000))
+        y = int(round(float(p["y"]) * 1000))
+        w = max(1, int(round(float(p["w_draw"]) * 1000)))
+        h = max(1, int(round(float(p["h_draw"]) * 1000)))
+        clip_id = f"clip_{sid}_{i}"
+        codigo = html_escape(p.get("codigo", ""))
+        desc = html_escape(str(p.get("descricao", ""))[:28])
+        medida = f"{int(round(float(p['w_draw'])*1000))}x{int(round(float(p['h_draw'])*1000))}"
+        fs = max(18, min(42, int(min(w / 8, h / 4))))
+        fill = cor_hash(p.get("codigo", i))
+        parts.append(f'<clipPath id="{clip_id}"><rect x="{x+3}" y="{y+3}" width="{max(w-6,1)}" height="{max(h-6,1)}"/></clipPath>')
+        parts.append(f'<rect x="{x}" y="{y}" width="{w}" height="{h}" fill="{fill}" stroke="#334155" stroke-width="3"/>')
+        parts.append(f'<g clip-path="url(#{clip_id})">')
+        parts.append(f'<text x="{x+10}" y="{y+fs+8}" font-size="{fs}" font-family="Arial" fill="#111827">{codigo} | {medida}</text>')
+        if h > 120 and w > 220:
+            parts.append(f'<text x="{x+10}" y="{y+(fs*2)+16}" font-size="{max(16, int(fs*0.75))}" font-family="Arial" fill="#334155">{desc}</text>')
+        parts.append('</g>')
     parts.append("</svg>")
     return "".join(parts)
+
+
+def _nome_modo_plano(modo):
+    if modo == "guilhotina":
+        return "Guilhotina por faixas"
+    if modo == "otimizado":
+        return "Otimizado automático 95%"
+    return "Encaixe livre otimizado"
 
 
 def html_planos(planos):
     if not planos:
         return ""
-    html = ['<div class="card"><h2>Plano de corte visual</h2><p class="hint">Desenho chapa por chapa. Para salvar em PDF, use o botão Imprimir / salvar PDF.</p></div>']
+    html = ['<div class="card"><h2>Plano de corte visual</h2><p class="hint">O sistema roda múltiplas estratégias e busca atingir 95%. Quando a meta não for possível para a geometria das peças, ele mostra o melhor resultado encontrado.</p></div>']
     for grupo in planos:
         material = grupo["material"]
-        modo = "Guilhotina por faixas" if grupo["modo"] == "guilhotina" else "Encaixe livre"
+        modo = _nome_modo_plano(grupo.get("modo", "encaixe"))
+        ap = grupo.get("aproveitamento_geral", 0) * 100
+        meta = grupo.get("meta_alvo", META_APROVEITAMENTO_PADRAO) * 100
+        status = '<span class="badge ok">Meta atingida</span>' if grupo.get("meta_atingida") else '<span class="badge danger">Abaixo da meta</span>'
+        html.append(
+            f'<div class="card"><h2>{html_escape(material)} — Resumo do plano</h2>'
+            f'<div class="grid"><div class="stat"><span class="hint">Aproveitamento geral</span><br><b>{fmt_num(ap,1)}%</b><br>{status}</div>'
+            f'<div class="stat"><span class="hint">Meta</span><br><b>{fmt_num(meta,1)}%</b></div>'
+            f'<div class="stat"><span class="hint">Chapas usadas</span><br><b>{grupo.get("chapas_total",0)}</b></div>'
+            f'<div class="stat"><span class="hint">Sobra total</span><br><b>{fmt_num(grupo.get("sobra_total_m2",0),3)} m²</b></div></div>'
+            f'<p class="hint">Modo escolhido: <b>{html_escape(modo)}</b>. Estratégia: <b>{html_escape(grupo.get("estrategia", ""))}</b>. '
+            f'Limite teórico por área, sem considerar geometria: {fmt_num(grupo.get("limite_teorico_area",0)*100,1)}%.</p></div>'
+        )
         for ch in grupo["chapas"]:
-            html.append(f'<div class="card sheet-card"><h2>{html_escape(material)} — Chapa {ch["numero"]} — {html_escape(modo)}</h2><div class="grid"><div class="stat"><span class="hint">Aproveitamento real desta chapa</span><br><b>{fmt_num(ch["aproveitamento"]*100,1)}%</b></div><div class="stat"><span class="hint">Área das peças</span><br><b>{fmt_num(ch["area_pecas"],3)} m²</b></div><div class="stat"><span class="hint">Sobra estimada</span><br><b>{fmt_num(ch["sobra_m2"],3)} m²</b></div></div><div class="svgwrap">{svg_chapa(ch)}</div><h3>Sequência sugerida</h3><div class="cutseq"><ol>{"".join("<li>"+html_escape(s)+"</li>" for s in ch.get("sequencia", [])[:120])}</ol></div></div>')
+            html.append(
+                f'<div class="card sheet-card"><h2>{html_escape(material)} — Chapa {ch["numero"]} — {html_escape(_nome_modo_plano(ch.get("modo", grupo.get("modo", "encaixe"))))}</h2>'
+                f'<div class="grid"><div class="stat"><span class="hint">Aproveitamento real desta chapa</span><br><b>{fmt_num(ch["aproveitamento"]*100,1)}%</b></div>'
+                f'<div class="stat"><span class="hint">Área das peças</span><br><b>{fmt_num(ch["area_pecas"],3)} m²</b></div>'
+                f'<div class="stat"><span class="hint">Sobra estimada</span><br><b>{fmt_num(ch["sobra_m2"],3)} m²</b></div></div>'
+                f'<div class="svgwrap">{svg_chapa(ch)}</div><h3>Sequência sugerida</h3>'
+                f'<div class="cutseq"><ol>{"".join("<li>"+html_escape(s)+"</li>" for s in ch.get("sequencia", [])[:120])}</ol></div></div>'
+            )
     return "\n".join(html)
-
 
 def montar_resultado(entradas, itens, resumo, desconhecidos, planos=None, calculo_id=None):
     msg = f'<div class="card"><span class="badge ok">Histórico salvo no cálculo #{calculo_id}</span></div>' if calculo_id else ""
