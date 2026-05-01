@@ -56,6 +56,9 @@ KERF_MM_PADRAO = float(os.environ.get("KERF_MM", "4"))
 META_APROVEITAMENTO_PADRAO = float(os.environ.get("META_APROVEITAMENTO", "0.95"))
 PERMITE_GIRAR_90_PADRAO = os.environ.get("PERMITE_GIRAR_90", "1") != "0"
 MAX_PECAS_PLANO = int(os.environ.get("MAX_PECAS_PLANO", "7000"))
+# Limites de segurança para não travar o Render em lotes grandes.
+MAX_SEGUNDOS_OTIMIZACAO = float(os.environ.get("MAX_SEGUNDOS_OTIMIZACAO", "8"))
+MAX_LINHAS_SEQUENCIA = int(os.environ.get("MAX_LINHAS_SEQUENCIA", "60"))
 
 LOGO_DOBUE_DATA = "/static/logos/dobue.png"
 LOGO_GRAUNA_DATA = "/static/logos/grauna.png"
@@ -148,6 +151,19 @@ def cor_hash(valor):
 
 def agora_iso():
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+
+def adicionar_sequencia(ch, texto):
+    """Guarda uma sequência curta e estável para não travar a página/PDF."""
+    seq = ch.setdefault("sequencia", [])
+    if len(seq) < MAX_LINHAS_SEQUENCIA:
+        seq.append(str(texto))
+    elif len(seq) == MAX_LINHAS_SEQUENCIA:
+        seq.append("Sequência resumida: demais cortes seguem o mesmo padrão de encaixe/faixa.")
+
+
+def _tempo_esgotado(inicio):
+    return (time.time() - inicio) >= MAX_SEGUNDOS_OTIMIZACAO
 
 
 def parse_cookie(header):
@@ -821,7 +837,7 @@ def _inserir_maxrects(ch, peca, pos, chapa_w, chapa_h, kerf):
     p = dict(peca)
     p.update({"x": x, "y": y, "w_draw": w, "h_draw": h, "girada": girada})
     ch["pecas"].append(p)
-    ch["sequencia"].append(
+    adicionar_sequencia(ch,
         f"Encaixar código {p['codigo']} em X={int(round(x*1000))} mm / Y={int(round(y*1000))} mm, "
         f"medida {int(round(w*1000))} x {int(round(h*1000))} mm."
     )
@@ -873,7 +889,7 @@ def _plano_maxrects_estrategia(pecas, chapa_w, chapa_h, kerf, permite_girar, ord
             pos = _melhor_posicao_maxrects(ch, peca, chapa_w, chapa_h, kerf, permite_girar, criterio)
             if pos is None:
                 raise ValueError(f"Peça código {peca['codigo']} não cabe na chapa {int(chapa_w*1000)} x {int(chapa_h*1000)} mm.")
-            ch["sequencia"].append("Abrir nova chapa.")
+            adicionar_sequencia(ch, "Abrir nova chapa.")
             _inserir_maxrects(ch, peca, pos, chapa_w, chapa_h, kerf)
             chapas.append(ch)
         else:
@@ -907,7 +923,7 @@ def _plano_shelf_estrategia(pecas, chapa_w, chapa_h, kerf, permite_girar, ordena
     def iniciar_faixa(ch, y, h):
         faixa = {"y": y, "h": h, "x": 0.0, "pecas": []}
         ch["faixas"].append(faixa)
-        ch["sequencia"].append(f"Cortar faixa guilhotinada de {int(round(h*1000))} mm a partir de Y={int(round(y*1000))} mm.")
+        adicionar_sequencia(ch, f"Cortar faixa guilhotinada de {int(round(h*1000))} mm a partir de Y={int(round(y*1000))} mm.")
         return faixa
 
     for peca in ordenadas:
@@ -925,7 +941,7 @@ def _plano_shelf_estrategia(pecas, chapa_w, chapa_h, kerf, permite_girar, ordena
             p = dict(peca); p.update({"x": x, "y": faixa["y"], "w_draw": w, "h_draw": h, "girada": girada})
             ch["pecas"].append(p); faixa["pecas"].append(p)
             faixa["x"] = x + w + kerf
-            ch["sequencia"].append(f"Na faixa {int(round(faixa['h']*1000))} mm, cortar código {p['codigo']} com {int(round(w*1000))} x {int(round(h*1000))} mm.")
+            adicionar_sequencia(ch, f"Na faixa {int(round(faixa['h']*1000))} mm, cortar código {p['codigo']} com {int(round(w*1000))} x {int(round(h*1000))} mm.")
             continue
 
         opcoes_nova = [(w, h, girada) for w, h, girada in _orientacoes_possiveis(peca, permite_girar) if w <= chapa_w + 1e-9 and h <= chapa_h + 1e-9]
@@ -944,7 +960,7 @@ def _plano_shelf_estrategia(pecas, chapa_w, chapa_h, kerf, permite_girar, ordena
         faixa = iniciar_faixa(ch, y_usado, h)
         p = dict(peca); p.update({"x": 0.0, "y": y_usado, "w_draw": w, "h_draw": h, "girada": girada})
         ch["pecas"].append(p); faixa["pecas"].append(p); faixa["x"] = w + kerf
-        ch["sequencia"].append(f"Na nova faixa, cortar código {p['codigo']} com {int(round(w*1000))} x {int(round(h*1000))} mm.")
+        adicionar_sequencia(ch, f"Na nova faixa, cortar código {p['codigo']} com {int(round(w*1000))} x {int(round(h*1000))} mm.")
     if ch["pecas"]:
         chapas.append(ch)
     return finalizar_chapas(chapas, chapa_w, chapa_h, "guilhotina", f"Faixas horizontais / {ordenacao}")
@@ -1035,16 +1051,35 @@ def _metadados_plano(chapas, chapa_w, chapa_h, meta=META_APROVEITAMENTO_PADRAO):
     }
 
 
+def _listas_estrategias_por_tamanho(qtd_pecas):
+    """Define quantas tentativas serão feitas conforme o tamanho do lote."""
+    if qtd_pecas >= 1200:
+        return ["area_desc", "lado_maior_desc"], ["baf", "bssf"], ["area_desc", "lado_maior_desc"]
+    if qtd_pecas >= 500:
+        return ["area_desc", "lado_maior_desc", "altura_desc"], ["baf", "bssf", "contato"], ["area_desc", "lado_maior_desc", "altura_desc"]
+    if qtd_pecas >= 180:
+        return ["area_desc", "lado_maior_desc", "largura_desc", "altura_desc"], ["baf", "bssf", "contato", "top_left"], ["area_desc", "lado_maior_desc", "largura_desc", "altura_desc"]
+    return ["area_desc", "lado_maior_desc", "largura_desc", "altura_desc", "perimetro_desc", "estreitas_depois"], ["baf", "bssf", "blsf", "contato", "top_left"], ["area_desc", "lado_maior_desc", "largura_desc", "altura_desc", "perimetro_desc"]
+
+
 def plano_encaixe_livre(pecas, chapa_w, chapa_h, kerf, permite_girar):
-    """Encaixe livre otimizado por múltiplas estratégias MaxRects."""
-    ordenacoes = ["area_desc", "lado_maior_desc", "largura_desc", "altura_desc", "perimetro_desc", "estreitas_depois", "quadradas_primeiro"]
-    criterios = ["baf", "bssf", "blsf", "contato", "top_left", "densidade"]
+    """Encaixe livre estável e rápido. Mantém as melhores estratégias sem travar o Render."""
+    inicio = time.time()
+    ordenacoes, criterios, _ = _listas_estrategias_por_tamanho(len(pecas))
     candidatos = []
     erros = []
+
     for ordenacao in ordenacoes:
         for criterio in criterios:
+            if candidatos and _tempo_esgotado(inicio):
+                return _selecionar_melhor_plano(candidatos, chapa_w, chapa_h)
             try:
-                candidatos.append(_plano_maxrects_estrategia(pecas, chapa_w, chapa_h, kerf, permite_girar, ordenacao, criterio))
+                plano = _plano_maxrects_estrategia(pecas, chapa_w, chapa_h, kerf, permite_girar, ordenacao, criterio)
+                candidatos.append(plano)
+                # Se já atingiu a meta e está no mínimo teórico de chapas, não perde tempo procurando demais.
+                meta = _metadados_plano(plano, chapa_w, chapa_h)
+                if meta["meta_atingida"] and meta["chapas_total"] <= meta["chapas_min_area"]:
+                    return plano
             except Exception as exc:
                 erros.append(str(exc))
     if not candidatos and erros:
@@ -1053,14 +1088,21 @@ def plano_encaixe_livre(pecas, chapa_w, chapa_h, kerf, permite_girar):
 
 
 def plano_guilhotina_faixas(pecas, chapa_w, chapa_h, kerf, permite_girar):
-    """Plano guilhotinado por faixas com várias ordenações e direções."""
-    ordenacoes = ["area_desc", "lado_maior_desc", "largura_desc", "altura_desc", "perimetro_desc", "estreitas_depois"]
+    """Plano guilhotinado por faixas, rápido e com sequência mais limpa."""
+    inicio = time.time()
+    _, _, ordenacoes = _listas_estrategias_por_tamanho(len(pecas))
     candidatos = []
     erros = []
     for ordenacao in ordenacoes:
         for orientacao in ["horizontal", "vertical"]:
+            if candidatos and _tempo_esgotado(inicio):
+                return _selecionar_melhor_plano(candidatos, chapa_w, chapa_h)
             try:
-                candidatos.append(_plano_shelf_estrategia(pecas, chapa_w, chapa_h, kerf, permite_girar, ordenacao, orientacao))
+                plano = _plano_shelf_estrategia(pecas, chapa_w, chapa_h, kerf, permite_girar, ordenacao, orientacao)
+                candidatos.append(plano)
+                meta = _metadados_plano(plano, chapa_w, chapa_h)
+                if meta["meta_atingida"] and meta["chapas_total"] <= meta["chapas_min_area"]:
+                    return plano
             except Exception as exc:
                 erros.append(str(exc))
     if not candidatos and erros:
@@ -1069,15 +1111,29 @@ def plano_guilhotina_faixas(pecas, chapa_w, chapa_h, kerf, permite_girar):
 
 
 def plano_otimizado_meta95(pecas, chapa_w, chapa_h, kerf, permite_girar):
-    """Escolhe automaticamente entre encaixe livre e guilhotina, mirando 95%."""
+    """Compara estratégias rápidas e escolhe a melhor sem travar."""
     candidatos = []
-    for fn in (plano_encaixe_livre, plano_guilhotina_faixas):
+    erros = []
+
+    # Primeiro guilhotina: normalmente é mais rápida, regular e fácil para operação.
+    for fn in (plano_guilhotina_faixas, plano_encaixe_livre):
         try:
-            candidatos.append(fn(pecas, chapa_w, chapa_h, kerf, permite_girar))
-        except Exception:
-            pass
+            plano = fn(pecas, chapa_w, chapa_h, kerf, permite_girar)
+            if plano:
+                candidatos.append(plano)
+                meta = _metadados_plano(plano, chapa_w, chapa_h)
+                if meta["meta_atingida"] and meta["chapas_total"] <= meta["chapas_min_area"]:
+                    melhor = plano
+                    for ch in melhor:
+                        ch["modo"] = "otimizado"
+                    return melhor
+        except Exception as exc:
+            erros.append(str(exc))
+
     if not candidatos:
-        return plano_encaixe_livre(pecas, chapa_w, chapa_h, kerf, permite_girar)
+        if erros:
+            raise ValueError(erros[-1])
+        return []
     melhor = _selecionar_melhor_plano(candidatos, chapa_w, chapa_h)
     for ch in melhor:
         ch["modo"] = "otimizado"
@@ -1190,7 +1246,7 @@ def gerar_xlsx_historico():
 # ============================================================
 
 CSS = """
-:root{--bg:#f3f6fb;--card:#fff;--text:#0f1f35;--muted:#53657e;--blue:#1f5eea;--border:#dfe6f0;--danger:#b42318;--ok:#027a48}*{box-sizing:border-box}body{font-family:Arial,Helvetica,sans-serif;margin:0;background:var(--bg);color:var(--text)}.wrap{max-width:1220px;margin:0 auto;padding:20px}.header{display:flex;align-items:center;gap:20px;margin-bottom:18px}.logo-main{height:78px;max-width:260px;object-fit:contain}.header h1{font-size:26px;margin:0 0 4px}.header p{margin:0;color:var(--muted)}.nav{display:flex;gap:10px;flex-wrap:wrap;margin-bottom:18px}.nav a,.btn{display:inline-flex;align-items:center;justify-content:center;border:1px solid var(--border);background:#fff;color:#064ceb;text-decoration:none;border-radius:10px;padding:10px 14px;font-weight:700;cursor:pointer;font-size:14px}.btn.primary{background:var(--blue);color:#fff;border-color:var(--blue)}.card{background:var(--card);border:1px solid var(--border);border-radius:18px;padding:18px;margin:14px 0;box-shadow:0 8px 24px rgba(17,33,61,.06)}.card h2{margin:0 0 16px;font-size:24px}.hint{color:var(--muted);font-size:14px}.row{display:grid;grid-template-columns:180px 1fr 160px 48px;gap:10px;margin:8px 0}.row2{display:grid;grid-template-columns:1fr 1fr 1fr;gap:12px}input,select,textarea{width:100%;border:1px solid var(--border);border-radius:10px;padding:11px 12px;font-size:14px;background:#fff}textarea{min-height:260px;resize:vertical;font-family:Consolas,Menlo,monospace;line-height:1.45}.paste-grid{display:grid;grid-template-columns:1fr 180px;gap:12px;margin-top:12px}.paste-grid label{display:block;font-weight:800;margin:0 0 7px}.minihelp{background:#f8fafc;border:1px dashed var(--border);border-radius:12px;padding:10px 12px;margin:10px 0;color:#53657e;font-size:13px}.counter{font-size:13px;color:#53657e;margin-top:6px}.toolbar{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-top:10px}table{width:100%;border-collapse:separate;border-spacing:0;border:1px solid var(--border);border-radius:12px;overflow:hidden;background:#fff}th,td{padding:10px 12px;border-bottom:1px solid var(--border);text-align:left;font-size:14px;vertical-align:top}th{background:#f8fafc;font-weight:800}tr:last-child td{border-bottom:none}.num{text-align:right}.badge{display:inline-block;border-radius:999px;background:#eef2ff;color:#123cbd;padding:4px 8px;font-size:12px}.badge.danger{background:#fee4e2;color:#b42318}.badge.ok{background:#d1fadf;color:#027a48}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:12px}.stat{background:#f8fafc;border:1px solid var(--border);border-radius:14px;padding:14px}.stat b{font-size:24px}.actions{display:flex;gap:10px;flex-wrap:wrap;margin-top:12px}.footer{display:flex;justify-content:center;align-items:center;gap:26px;margin:26px auto 10px;flex-wrap:wrap}.footer img{height:58px;max-width:230px;object-fit:contain;filter:grayscale(.1);opacity:.88}.sheet-card{page-break-inside:avoid}.svgwrap{overflow:auto;border:1px solid var(--border);border-radius:12px;background:#fff;padding:8px}.cut-svg{display:block;width:100%;height:auto;max-height:720px;background:#fff}.cutseq{font-size:13px;color:#334155;columns:2}.login{max-width:430px;margin:80px auto}@media (max-width:760px){.paste-grid{grid-template-columns:1fr}.row2{grid-template-columns:1fr}}@media print{.nav,.actions,.no-print,.btn{display:none!important}.wrap{max-width:100%;padding:0}.card{box-shadow:none;border:1px solid #999;page-break-inside:avoid}body{background:#fff}}
+:root{--bg:#f3f6fb;--card:#fff;--text:#0f1f35;--muted:#53657e;--blue:#1f5eea;--border:#dfe6f0;--danger:#b42318;--ok:#027a48}*{box-sizing:border-box}body{font-family:Arial,Helvetica,sans-serif;margin:0;background:var(--bg);color:var(--text)}.wrap{max-width:1220px;margin:0 auto;padding:20px}.header{display:flex;align-items:center;gap:20px;margin-bottom:18px}.logo-main{height:78px;max-width:260px;object-fit:contain}.header h1{font-size:26px;margin:0 0 4px}.header p{margin:0;color:var(--muted)}.nav{display:flex;gap:10px;flex-wrap:wrap;margin-bottom:18px}.nav a,.btn{display:inline-flex;align-items:center;justify-content:center;border:1px solid var(--border);background:#fff;color:#064ceb;text-decoration:none;border-radius:10px;padding:10px 14px;font-weight:700;cursor:pointer;font-size:14px}.btn.primary{background:var(--blue);color:#fff;border-color:var(--blue)}.card{background:var(--card);border:1px solid var(--border);border-radius:18px;padding:18px;margin:14px 0;box-shadow:0 8px 24px rgba(17,33,61,.06)}.card h2{margin:0 0 16px;font-size:24px}.hint{color:var(--muted);font-size:14px}.row{display:grid;grid-template-columns:180px 1fr 160px 48px;gap:10px;margin:8px 0}.row2{display:grid;grid-template-columns:1fr 1fr 1fr;gap:12px}input,select,textarea{width:100%;border:1px solid var(--border);border-radius:10px;padding:11px 12px;font-size:14px;background:#fff}textarea{min-height:260px;resize:vertical;font-family:Consolas,Menlo,monospace;line-height:1.45}.paste-grid{display:grid;grid-template-columns:1fr 180px;gap:12px;margin-top:12px}.paste-grid label{display:block;font-weight:800;margin:0 0 7px}.minihelp{background:#f8fafc;border:1px dashed var(--border);border-radius:12px;padding:10px 12px;margin:10px 0;color:#53657e;font-size:13px}.counter{font-size:13px;color:#53657e;margin-top:6px}.toolbar{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-top:10px}table{width:100%;border-collapse:separate;border-spacing:0;border:1px solid var(--border);border-radius:12px;overflow:hidden;background:#fff}th,td{padding:10px 12px;border-bottom:1px solid var(--border);text-align:left;font-size:14px;vertical-align:top}th{background:#f8fafc;font-weight:800}tr:last-child td{border-bottom:none}.num{text-align:right}.badge{display:inline-block;border-radius:999px;background:#eef2ff;color:#123cbd;padding:4px 8px;font-size:12px}.badge.danger{background:#fee4e2;color:#b42318}.badge.ok{background:#d1fadf;color:#027a48}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:12px}.stat{background:#f8fafc;border:1px solid var(--border);border-radius:14px;padding:14px}.stat b{font-size:24px}.actions{display:flex;gap:10px;flex-wrap:wrap;margin-top:12px}.footer{display:flex;justify-content:center;align-items:center;gap:26px;margin:26px auto 10px;flex-wrap:wrap}.footer img{height:58px;max-width:230px;object-fit:contain;filter:grayscale(.1);opacity:.88}.sheet-card{page-break-inside:avoid}.svgwrap{overflow:auto;border:1px solid var(--border);border-radius:12px;background:#fff;padding:8px}.cut-svg{display:block;width:100%;height:auto;max-height:720px;background:#fff;object-fit:contain}.cutseq{font-size:13px;color:#334155;columns:2}.login{max-width:430px;margin:80px auto}@media (max-width:760px){.paste-grid{grid-template-columns:1fr}.row2{grid-template-columns:1fr}}@media print{.nav,.actions,.no-print,.btn{display:none!important}.wrap{max-width:100%;padding:0}.card{box-shadow:none;border:1px solid #999;page-break-inside:avoid}body{background:#fff}}
 """
 
 
@@ -1226,7 +1282,7 @@ def pagina_corte(result_html=""):
         </div>
         <div class="toolbar no-print"><button type="button" class="btn" onclick="limparEntrada()">Limpar entrada</button><button type="button" class="btn" onclick="exemploEntrada()">Preencher exemplo</button></div>
         {datalist_codigos()}
-        <div class="row2" style="margin-top:12px"><div><label class="hint">Tipo de plano de corte</label><select name="modo_corte"><option value="otimizado">Otimizado automático 95%</option><option value="encaixe">Encaixe livre otimizado</option><option value="guilhotina">Guilhotina por faixas</option></select></div><div><label class="hint">Salvar histórico</label><select name="salvar_historico"><option value="1">Sim</option><option value="0">Não</option></select></div><div><label class="hint">Ação</label><select name="acao"><option value="calcular">Apenas calcular consumo</option><option value="plano">Calcular e gerar plano de corte</option></select></div></div>
+        <div class="row2" style="margin-top:12px"><div><label class="hint">Tipo de plano de corte</label><select name="modo_corte"><option value="otimizado">Otimizado rápido / estável</option><option value="encaixe">Encaixe livre otimizado</option><option value="guilhotina">Guilhotina por faixas</option></select></div><div><label class="hint">Salvar histórico</label><select name="salvar_historico"><option value="1">Sim</option><option value="0">Não</option></select></div><div><label class="hint">Ação</label><select name="acao"><option value="calcular">Apenas calcular consumo</option><option value="plano">Calcular e gerar plano de corte</option></select></div></div>
         <div class="actions"><button class="btn primary" type="submit">Executar</button><button type="button" class="btn" onclick="window.print()">Imprimir / salvar PDF</button></div>
     </form>{result_html}
     <script>
@@ -1430,7 +1486,7 @@ def _nome_modo_plano(modo):
     if modo == "guilhotina":
         return "Guilhotina por faixas"
     if modo == "otimizado":
-        return "Otimizado automático 95%"
+        return "Otimizado rápido / estável"
     return "Encaixe livre otimizado"
 
 
