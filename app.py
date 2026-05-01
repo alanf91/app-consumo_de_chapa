@@ -784,11 +784,18 @@ def _pontuar_posicao(criterio, ch, rect, x, y, w, h, chapa_w, chapa_h):
 
 
 def _candidato_interfere_com_pecas(ch, x, y, w, h, kerf):
-    cand = {"x": x, "y": y, "w": w, "h": h}
+    """Verifica colisão respeitando o kerf, sem bloquear peças encostadas no limite correto.
+
+    A versão anterior era rígida demais no arredondamento e podia impedir que uma peça
+    fosse posicionada exatamente após a folga da serra, abrindo chapas desnecessárias.
+    """
+    eps = 1e-6
     for q in ch.get("pecas", []):
-        # folga de serra para direita/baixo coerente com o split dos espaços livres
-        occ = {"x": q["x"] - 1e-9, "y": q["y"] - 1e-9, "w": q["w_draw"] + kerf + 2e-9, "h": q["h_draw"] + kerf + 2e-9}
-        if _rect_intersect(cand, occ):
+        ox = float(q["x"])
+        oy = float(q["y"])
+        ow = float(q["w_draw"]) + kerf
+        oh = float(q["h_draw"]) + kerf
+        if (x < ox + ow - eps and x + w > ox + eps and y < oy + oh - eps and y + h > oy + eps):
             return True
     return False
 
@@ -865,6 +872,238 @@ def _ordenar_pecas(pecas, ordenacao):
 
 def _chapa_vazia(chapa_w, chapa_h):
     return {"pecas": [], "livres": [{"x": 0.0, "y": 0.0, "w": chapa_w, "h": chapa_h}], "sequencia": []}
+
+
+# ============================================================
+# ALGORITMO OPORTUNIDADES DE SOBRA
+# ============================================================
+
+def _assinatura_peca(p):
+    return (
+        str(p.get("codigo", "")),
+        str(p.get("descricao", "")),
+        str(p.get("produto", "")),
+        str(p.get("material", "")),
+        round(float(p.get("w", 0)), 6),
+        round(float(p.get("h", 0)), 6),
+        int(p.get("espessura_mm", 0) or 0),
+    )
+
+
+def _agrupar_pecas_otimizacao(pecas, ordenacao="area_desc"):
+    grupos = {}
+    for p in pecas:
+        key = _assinatura_peca(p)
+        if key not in grupos:
+            base = dict(p)
+            grupos[key] = {"peca": base, "count": 0, "area": float(p["w"]) * float(p["h"])}
+        grupos[key]["count"] += 1
+    saida = list(grupos.values())
+
+    def chave(g):
+        p = g["peca"]
+        area = g["area"]
+        w, h = float(p["w"]), float(p["h"])
+        if ordenacao == "lado_maior_desc":
+            return (max(w, h), area, g["count"])
+        if ordenacao == "largura_desc":
+            return (w, h, area, g["count"])
+        if ordenacao == "altura_desc":
+            return (h, w, area, g["count"])
+        if ordenacao == "estreitas_depois":
+            return (min(w, h), area, g["count"])
+        return (area, max(w, h), min(w, h), g["count"])
+
+    saida.sort(key=chave, reverse=True)
+    return saida
+
+
+def _grupos_restantes(grupos):
+    return sum(max(0, int(g.get("count", 0))) for g in grupos)
+
+
+def _area_ocupada_chapa(ch):
+    return sum(float(p["w_draw"]) * float(p["h_draw"]) for p in ch.get("pecas", []))
+
+
+def _melhor_posicao_grupo_oportunidade(ch, peca, chapa_w, chapa_h, kerf, permite_girar):
+    melhor = None
+    area_chapa = chapa_w * chapa_h
+    ocupada = _area_ocupada_chapa(ch)
+    for rect in ch.get("livres", []):
+        for w, h, girada in _orientacoes_possiveis(peca, permite_girar):
+            if w > rect["w"] + 1e-9 or h > rect["h"] + 1e-9:
+                continue
+            x, y = rect["x"], rect["y"]
+            if x + w > chapa_w + 1e-9 or y + h > chapa_h + 1e-9:
+                continue
+            if _candidato_interfere_com_pecas(ch, x, y, w, h, kerf):
+                continue
+
+            area = w * h
+            sobra_area_rect = max(rect["w"] * rect["h"] - area, 0.0)
+            sobra_w = max(rect["w"] - w, 0.0)
+            sobra_h = max(rect["h"] - h, 0.0)
+            short_side = min(sobra_w, sobra_h)
+            long_side = max(sobra_w, sobra_h)
+            contato = _contato_score(ch, x, y, w, h, chapa_w, chapa_h)
+            util_depois = (ocupada + area) / area_chapa if area_chapa else 0.0
+
+            # Lógica principal: enxergar oportunidade de sobra.
+            # 1) Prefere peça que preenche bem o retângulo livre.
+            # 2) Prefere peça que encosta em bordas/outras peças.
+            # 3) Prefere ocupar mais área sem gerar retalho ruim.
+            preenchimento_rect = area / (rect["w"] * rect["h"]) if rect["w"] * rect["h"] else 0.0
+            score = (
+                -preenchimento_rect,
+                short_side,
+                sobra_area_rect,
+                -contato,
+                -area,
+                -util_depois,
+                y,
+                x,
+            )
+            cand = (score, rect, x, y, w, h, girada)
+            if melhor is None or cand[0] < melhor[0]:
+                melhor = cand
+    return melhor
+
+
+def _selecionar_semente_chapa(grupos, chapa_w, chapa_h, permite_girar):
+    for gi, g in enumerate(grupos):
+        if g["count"] <= 0:
+            continue
+        p = g["peca"]
+        if escolher_orientacao(p, {"x": 0.0, "y": 0.0, "w": chapa_w, "h": chapa_h}, permite_girar):
+            return gi
+    return None
+
+
+def _melhor_grupo_para_preencher_sobra(ch, grupos, chapa_w, chapa_h, kerf, permite_girar, inicio):
+    melhor = None
+    for gi, g in enumerate(grupos):
+        if g["count"] <= 0:
+            continue
+        if _tempo_esgotado(inicio):
+            break
+        p = g["peca"]
+        pos = _melhor_posicao_grupo_oportunidade(ch, p, chapa_w, chapa_h, kerf, permite_girar)
+        if pos is None:
+            continue
+        # Em empate, usa o grupo com mais peças restantes para esvaziar repetição.
+        score = (pos[0], -g["count"], gi)
+        if melhor is None or score < melhor[0]:
+            melhor = (score, gi, pos)
+    return melhor
+
+
+def _plano_oportunidades_estrategia(pecas, chapa_w, chapa_h, kerf, permite_girar, ordenacao="area_desc"):
+    """Preenche uma chapa procurando oportunidades entre TODAS as peças restantes.
+
+    Diferente do fluxo anterior, ele não segue cegamente a ordem das peças.
+    A cada espaço livre, ele pergunta: qual peça restante encaixa melhor aqui?
+    Isso é o que evita abrir chapas novas enquanto há sobras úteis nas chapas anteriores.
+    """
+    inicio = time.time()
+    grupos = _agrupar_pecas_otimizacao(pecas, ordenacao)
+    chapas = []
+    area_chapa = chapa_w * chapa_h
+
+    while _grupos_restantes(grupos) > 0:
+        if _tempo_esgotado(inicio) and chapas:
+            # Se esgotar o tempo no meio do processo, finaliza o restante com MaxRects rápido
+            restantes = []
+            for g in grupos:
+                for _ in range(max(0, int(g["count"]))):
+                    restantes.append(dict(g["peca"]))
+                g["count"] = 0
+            if restantes:
+                try:
+                    complemento = _plano_maxrects_estrategia(restantes, chapa_w, chapa_h, kerf, permite_girar, "area_desc", "baf")
+                    chapas.extend(complemento)
+                except Exception:
+                    for p in restantes:
+                        ch = _chapa_vazia(chapa_w, chapa_h)
+                        pos = _melhor_posicao_maxrects(ch, p, chapa_w, chapa_h, kerf, permite_girar, "baf")
+                        if pos is None:
+                            raise ValueError(f"Peça código {p['codigo']} não cabe na chapa {int(chapa_w*1000)} x {int(chapa_h*1000)} mm.")
+                        adicionar_sequencia(ch, "Abrir nova chapa por limite de tempo.")
+                        _inserir_maxrects(ch, p, pos, chapa_w, chapa_h, kerf)
+                        chapas.append(ch)
+            break
+
+        seed_idx = _selecionar_semente_chapa(grupos, chapa_w, chapa_h, permite_girar)
+        if seed_idx is None:
+            raise ValueError("Existe peça que não cabe na medida de chapa configurada.")
+
+        ch = _chapa_vazia(chapa_w, chapa_h)
+        seed = grupos[seed_idx]["peca"]
+        pos = _melhor_posicao_maxrects(ch, seed, chapa_w, chapa_h, kerf, permite_girar, "baf")
+        if pos is None:
+            raise ValueError(f"Peça código {seed['codigo']} não cabe na chapa {int(chapa_w*1000)} x {int(chapa_h*1000)} mm.")
+        adicionar_sequencia(ch, "Abrir nova chapa e iniciar preenchimento por oportunidades de sobra.")
+        _inserir_maxrects(ch, seed, pos, chapa_w, chapa_h, kerf)
+        grupos[seed_idx]["count"] -= 1
+
+        sem_melhora = 0
+        while _grupos_restantes(grupos) > 0:
+            if _tempo_esgotado(inicio):
+                break
+            antes = _area_ocupada_chapa(ch)
+            melhor = _melhor_grupo_para_preencher_sobra(ch, grupos, chapa_w, chapa_h, kerf, permite_girar, inicio)
+            if melhor is None:
+                break
+            _, gi, pos = melhor
+            p = grupos[gi]["peca"]
+            _inserir_maxrects(ch, p, pos, chapa_w, chapa_h, kerf)
+            grupos[gi]["count"] -= 1
+            depois = _area_ocupada_chapa(ch)
+            if depois <= antes + 1e-12:
+                sem_melhora += 1
+            else:
+                sem_melhora = 0
+            if sem_melhora >= 3:
+                break
+            # Se a chapa já está acima da meta e nenhuma peça restante encaixa melhor, fecha.
+            if area_chapa and depois / area_chapa >= META_APROVEITAMENTO_PADRAO:
+                teste = _melhor_grupo_para_preencher_sobra(ch, grupos, chapa_w, chapa_h, kerf, permite_girar, inicio)
+                if teste is None:
+                    break
+
+        chapas.append(ch)
+
+    return finalizar_chapas(chapas, chapa_w, chapa_h, "oportunidades", f"Oportunidades de sobra / {ordenacao}")
+
+
+def plano_oportunidades_sobra(pecas, chapa_w, chapa_h, kerf, permite_girar):
+    """Roda variações do algoritmo que preenche sobras úteis antes de abrir nova chapa."""
+    inicio = time.time()
+    ordenacoes, _, _ = _listas_estrategias_por_tamanho(len(pecas))
+    # Para a lógica de oportunidades, estas ordenações costumam ser as mais úteis.
+    preferidas = []
+    for o in ["area_desc", "lado_maior_desc", "altura_desc", "largura_desc", "estreitas_depois"]:
+        if o in ordenacoes and o not in preferidas:
+            preferidas.append(o)
+    if not preferidas:
+        preferidas = ["area_desc"]
+
+    candidatos = []
+    erros = []
+    for ordenacao in preferidas:
+        if candidatos and _tempo_esgotado(inicio):
+            return _selecionar_melhor_plano(candidatos, chapa_w, chapa_h)
+        try:
+            plano = _plano_oportunidades_estrategia(pecas, chapa_w, chapa_h, kerf, permite_girar, ordenacao)
+            candidatos.append(plano)
+            meta = _metadados_plano(plano, chapa_w, chapa_h)
+            if meta["meta_atingida"] and meta["chapas_total"] <= meta["chapas_min_area"]:
+                return plano
+        except Exception as exc:
+            erros.append(str(exc))
+    if not candidatos and erros:
+        raise ValueError(erros[-1])
+    return _selecionar_melhor_plano(candidatos, chapa_w, chapa_h)
 
 
 def _plano_maxrects_estrategia(pecas, chapa_w, chapa_h, kerf, permite_girar, ordenacao, criterio):
@@ -964,6 +1203,116 @@ def _plano_shelf_estrategia(pecas, chapa_w, chapa_h, kerf, permite_girar, ordena
     if ch["pecas"]:
         chapas.append(ch)
     return finalizar_chapas(chapas, chapa_w, chapa_h, "guilhotina", f"Faixas horizontais / {ordenacao}")
+
+
+
+def _plano_shelf_backfill_estrategia(pecas, chapa_w, chapa_h, kerf, permite_girar, ordenacao, orientacao_faixas="horizontal"):
+    """Guilhotina por faixas com retorno às chapas anteriores.
+
+    Esta é a lógica que resolve o problema apontado nas imagens: quando uma peça menor
+    aparece depois, o algoritmo volta nas faixas já abertas de chapas anteriores e tenta
+    ocupar as perdas laterais antes de abrir outra chapa.
+    """
+    if orientacao_faixas == "vertical":
+        pecas_swap = []
+        for p in pecas:
+            pp = dict(p)
+            pp["w"], pp["h"] = p["h"], p["w"]
+            pecas_swap.append(pp)
+        chapas_swap = _plano_shelf_backfill_estrategia(pecas_swap, chapa_h, chapa_w, kerf, permite_girar, ordenacao, "horizontal")
+        chapas = []
+        for ch in chapas_swap:
+            novo = {"pecas": [], "faixas": [], "sequencia": ["Plano guilhotinado vertical com preenchimento de sobras."] + ch.get("sequencia", [])}
+            for f in ch.get("faixas", []):
+                novo["faixas"].append({"y": f.get("y", 0), "h": f.get("h", 0), "x": f.get("x", 0), "pecas": []})
+            for pp in ch["pecas"]:
+                q = dict(pp)
+                old_x, old_y, old_w, old_h = pp["x"], pp["y"], pp["w_draw"], pp["h_draw"]
+                q["x"], q["y"], q["w_draw"], q["h_draw"] = old_y, old_x, old_h, old_w
+                novo["pecas"].append(q)
+            chapas.append(novo)
+        return finalizar_chapas(chapas, chapa_w, chapa_h, "guilhotina", f"Faixas verticais com backfill / {ordenacao}")
+
+    ordenadas = _ordenar_pecas(pecas, ordenacao)
+    chapas = []
+    area_chapa = chapa_w * chapa_h
+
+    def y_proxima_faixa(ch):
+        if not ch.get("faixas"):
+            return 0.0
+        return max(f["y"] + f["h"] for f in ch["faixas"]) + kerf
+
+    def criar_chapa():
+        return {"pecas": [], "faixas": [], "sequencia": []}
+
+    def criar_faixa(ch, y, h):
+        faixa = {"y": y, "h": h, "x": 0.0, "pecas": []}
+        ch["faixas"].append(faixa)
+        adicionar_sequencia(ch, f"Cortar faixa guilhotinada de {int(round(h*1000))} mm a partir de Y={int(round(y*1000))} mm.")
+        return faixa
+
+    def colocar(ch, faixa, peca, w, h, girada):
+        x = faixa["x"]
+        p = dict(peca)
+        p.update({"x": x, "y": faixa["y"], "w_draw": w, "h_draw": h, "girada": girada})
+        ch["pecas"].append(p)
+        faixa["pecas"].append(p)
+        faixa["x"] = x + w + kerf
+        adicionar_sequencia(ch, f"Na faixa {int(round(faixa['h']*1000))} mm, cortar código {p['codigo']} com {int(round(w*1000))} x {int(round(h*1000))} mm.")
+
+    for peca in ordenadas:
+        melhor = None
+
+        # 1) Primeiro tenta preencher perdas laterais em faixas já existentes, inclusive em chapas anteriores.
+        for ci, ch in enumerate(chapas):
+            area_atual = _area_ocupada_chapa(ch)
+            for fi, faixa in enumerate(ch.get("faixas", [])):
+                for w, h, girada in _orientacoes_possiveis(peca, permite_girar):
+                    if h <= faixa["h"] + 1e-9 and faixa["x"] + w <= chapa_w + 1e-9:
+                        rem_w = chapa_w - (faixa["x"] + w)
+                        slack_h = faixa["h"] - h
+                        util_depois = (area_atual + w*h) / area_chapa if area_chapa else 0.0
+                        # score começa com 0: preencher faixa existente é prioridade máxima.
+                        score = (0, rem_w, slack_h, -util_depois, ci, fi)
+                        cand = (score, "existente", ci, faixa, w, h, girada)
+                        if melhor is None or cand[0] < melhor[0]:
+                            melhor = cand
+
+        # 2) Se não couber em perda lateral, tenta abrir nova faixa em alguma chapa já aberta.
+        for ci, ch in enumerate(chapas):
+            y = y_proxima_faixa(ch)
+            area_atual = _area_ocupada_chapa(ch)
+            for w, h, girada in _orientacoes_possiveis(peca, permite_girar):
+                if w <= chapa_w + 1e-9 and y + h <= chapa_h + 1e-9:
+                    rem_h = chapa_h - (y + h)
+                    util_depois = (area_atual + w*h) / area_chapa if area_chapa else 0.0
+                    # Ao abrir nova faixa, prioriza faixa mais baixa. Isso evita linhas altas/tortas
+                    # e preserva espaço vertical para novas faixas e peças menores.
+                    score = (1, h, rem_h, -util_depois, ci)
+                    cand = (score, "nova_faixa", ci, None, w, h, girada)
+                    if melhor is None or cand[0] < melhor[0]:
+                        melhor = cand
+
+        # 3) Se não houver oportunidade em chapas existentes, abre nova chapa.
+        if melhor is None:
+            opcoes = [(w, h, girada) for w, h, girada in _orientacoes_possiveis(peca, permite_girar) if w <= chapa_w + 1e-9 and h <= chapa_h + 1e-9]
+            if not opcoes:
+                raise ValueError(f"Peça código {peca['codigo']} não cabe na chapa {int(chapa_w*1000)} x {int(chapa_h*1000)} mm.")
+            w, h, girada = min(opcoes, key=lambda o: (o[1], -o[0]))
+            ch = criar_chapa()
+            adicionar_sequencia(ch, "Abrir nova chapa.")
+            faixa = criar_faixa(ch, 0.0, h)
+            colocar(ch, faixa, peca, w, h, girada)
+            chapas.append(ch)
+            continue
+
+        _, tipo, ci, faixa, w, h, girada = melhor
+        ch = chapas[ci]
+        if tipo == "nova_faixa":
+            faixa = criar_faixa(ch, y_proxima_faixa(ch), h)
+        colocar(ch, faixa, peca, w, h, girada)
+
+    return finalizar_chapas(chapas, chapa_w, chapa_h, "guilhotina", f"Faixas com backfill de sobras / {ordenacao}")
 
 
 def _aproveitamento_plano(chapas, chapa_w, chapa_h):
@@ -1098,7 +1447,7 @@ def plano_guilhotina_faixas(pecas, chapa_w, chapa_h, kerf, permite_girar):
             if candidatos and _tempo_esgotado(inicio):
                 return _selecionar_melhor_plano(candidatos, chapa_w, chapa_h)
             try:
-                plano = _plano_shelf_estrategia(pecas, chapa_w, chapa_h, kerf, permite_girar, ordenacao, orientacao)
+                plano = _plano_shelf_backfill_estrategia(pecas, chapa_w, chapa_h, kerf, permite_girar, ordenacao, orientacao)
                 candidatos.append(plano)
                 meta = _metadados_plano(plano, chapa_w, chapa_h)
                 if meta["meta_atingida"] and meta["chapas_total"] <= meta["chapas_min_area"]:
@@ -1111,12 +1460,13 @@ def plano_guilhotina_faixas(pecas, chapa_w, chapa_h, kerf, permite_girar):
 
 
 def plano_otimizado_meta95(pecas, chapa_w, chapa_h, kerf, permite_girar):
-    """Compara estratégias rápidas e escolhe a melhor sem travar."""
+    """Compara estratégias e prioriza o algoritmo que preenche oportunidades de sobra."""
     candidatos = []
     erros = []
 
-    # Primeiro guilhotina: normalmente é mais rápida, regular e fácil para operação.
-    for fn in (plano_guilhotina_faixas, plano_encaixe_livre):
+    # 1) Primeiro roda o algoritmo certo para o problema: preencher sobras úteis.
+    # 2) Depois compara com guilhotina e MaxRects tradicional.
+    for fn in (plano_guilhotina_faixas, plano_oportunidades_sobra, plano_encaixe_livre):
         try:
             plano = fn(pecas, chapa_w, chapa_h, kerf, permite_girar)
             if plano:
@@ -1155,6 +1505,8 @@ def gerar_planos(itens, resumo, modo):
             chapas = plano_guilhotina_faixas(pecas, chapa_w, chapa_h, kerf, permite)
         elif modo == "encaixe":
             chapas = plano_encaixe_livre(pecas, chapa_w, chapa_h, kerf, permite)
+        elif modo == "oportunidades":
+            chapas = plano_oportunidades_sobra(pecas, chapa_w, chapa_h, kerf, permite)
         else:
             chapas = plano_otimizado_meta95(pecas, chapa_w, chapa_h, kerf, permite)
 
@@ -1282,7 +1634,7 @@ def pagina_corte(result_html=""):
         </div>
         <div class="toolbar no-print"><button type="button" class="btn" onclick="limparEntrada()">Limpar entrada</button><button type="button" class="btn" onclick="exemploEntrada()">Preencher exemplo</button></div>
         {datalist_codigos()}
-        <div class="row2" style="margin-top:12px"><div><label class="hint">Tipo de plano de corte</label><select name="modo_corte"><option value="otimizado">Otimizado rápido / estável</option><option value="encaixe">Encaixe livre otimizado</option><option value="guilhotina">Guilhotina por faixas</option></select></div><div><label class="hint">Salvar histórico</label><select name="salvar_historico"><option value="1">Sim</option><option value="0">Não</option></select></div><div><label class="hint">Ação</label><select name="acao"><option value="calcular">Apenas calcular consumo</option><option value="plano">Calcular e gerar plano de corte</option></select></div></div>
+        <div class="row2" style="margin-top:12px"><div><label class="hint">Tipo de plano de corte</label><select name="modo_corte"><option value="otimizado">Otimizado automático com oportunidades</option><option value="oportunidades">Oportunidades de sobra</option><option value="encaixe">Encaixe livre tradicional</option><option value="guilhotina">Guilhotina por faixas</option></select></div><div><label class="hint">Salvar histórico</label><select name="salvar_historico"><option value="1">Sim</option><option value="0">Não</option></select></div><div><label class="hint">Ação</label><select name="acao"><option value="calcular">Apenas calcular consumo</option><option value="plano">Calcular e gerar plano de corte</option></select></div></div>
         <div class="actions"><button class="btn primary" type="submit">Executar</button><button type="button" class="btn" onclick="window.print()">Imprimir / salvar PDF</button></div>
     </form>{result_html}
     <script>
@@ -1485,15 +1837,17 @@ def svg_chapa(chapa):
 def _nome_modo_plano(modo):
     if modo == "guilhotina":
         return "Guilhotina por faixas"
+    if modo == "oportunidades":
+        return "Oportunidades de sobra"
     if modo == "otimizado":
-        return "Otimizado rápido / estável"
-    return "Encaixe livre otimizado"
+        return "Otimizado automático com oportunidades"
+    return "Encaixe livre tradicional"
 
 
 def html_planos(planos):
     if not planos:
         return ""
-    html = ['<div class="card"><h2>Plano de corte visual</h2><p class="hint">O sistema testa várias estratégias, busca a meta de 95% e agora também prioriza planos mais regulares e mais fáceis de cortar. Quando 95% não for fisicamente possível para a geometria das peças, ele mostra o melhor resultado encontrado.</p></div>']
+    html = ['<div class="card"><h2>Plano de corte visual</h2><p class="hint">O sistema agora procura oportunidades de sobra: antes de abrir uma nova chapa, ele testa quais peças restantes cabem nos vazios das chapas atuais. Quando 95% não for fisicamente possível pela geometria das peças, ele mostra o melhor resultado encontrado.</p></div>']
     for grupo in planos:
         material = grupo["material"]
         modo = _nome_modo_plano(grupo.get("modo", "encaixe"))
