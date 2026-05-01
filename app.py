@@ -1510,6 +1510,10 @@ def gerar_planos(itens, resumo, modo):
         else:
             chapas = plano_otimizado_meta95(pecas, chapa_w, chapa_h, kerf, permite)
 
+        # A sequência operacional detalhada foi removida da saída para deixar o sistema mais leve.
+        for ch in chapas:
+            ch["sequencia"] = []
+
         meta = _metadados_plano(chapas, chapa_w, chapa_h)
         estrategia = chapas[0].get("estrategia", "") if chapas else ""
         planos.append({
@@ -1844,10 +1848,90 @@ def _nome_modo_plano(modo):
     return "Encaixe livre tradicional"
 
 
+def resumo_planos_por_tipo_html(planos):
+    """Resumo real do plano gerado por tipo de chapa/material."""
+    if not planos:
+        return ""
+
+    rows = []
+    total_chapas = 0
+    total_area_pecas = 0.0
+    total_area_chapas = 0.0
+    total_perda = 0.0
+
+    for grupo in planos:
+        chapas = grupo.get("chapas", [])
+        if not chapas:
+            continue
+
+        material = grupo.get("material", "")
+        primeira = chapas[0]
+        chapa_w = float(primeira.get("chapa_w", 0) or 0)
+        chapa_h = float(primeira.get("chapa_h", 0) or 0)
+        area_chapa = chapa_w * chapa_h
+        qtd_chapas = len(chapas)
+        area_pecas = sum(float(ch.get("area_pecas", 0) or 0) for ch in chapas)
+        area_chapas = qtd_chapas * area_chapa
+        perda = max(area_chapas - area_pecas, 0.0)
+        aproveitamento = area_pecas / area_chapas if area_chapas else 0.0
+        aproveitamentos = [float(ch.get("aproveitamento", 0) or 0) for ch in chapas]
+        melhor = max(aproveitamentos) if aproveitamentos else 0.0
+        pior = min(aproveitamentos) if aproveitamentos else 0.0
+        qtd_pecas = sum(len(ch.get("pecas", [])) for ch in chapas)
+        meta = grupo.get("meta_alvo", META_APROVEITAMENTO_PADRAO)
+        status = '<span class="badge ok">Meta atingida</span>' if aproveitamento >= meta - 1e-9 else '<span class="badge danger">Abaixo da meta</span>'
+
+        total_chapas += qtd_chapas
+        total_area_pecas += area_pecas
+        total_area_chapas += area_chapas
+        total_perda += perda
+
+        rows.append(
+            f'<tr>'
+            f'<td>{html_escape(material)}</td>'
+            f'<td>{fmt_m(chapa_w)} x {fmt_m(chapa_h)} m</td>'
+            f'<td class="num"><b>{qtd_chapas}</b></td>'
+            f'<td class="num">{qtd_pecas}</td>'
+            f'<td class="num">{fmt_num(area_pecas,3)} m²</td>'
+            f'<td class="num">{fmt_num(area_chapas,3)} m²</td>'
+            f'<td class="num">{fmt_num(perda,3)} m²</td>'
+            f'<td class="num"><b>{fmt_num(aproveitamento*100,1)}%</b></td>'
+            f'<td class="num">{fmt_num(melhor*100,1)}%</td>'
+            f'<td class="num">{fmt_num(pior*100,1)}%</td>'
+            f'<td>{status}</td>'
+            f'</tr>'
+        )
+
+    if not rows:
+        return ""
+
+    aproveitamento_total = total_area_pecas / total_area_chapas if total_area_chapas else 0.0
+    return (
+        '<div class="card">'
+        '<h2>Resumo real dos planos por tipo de chapa</h2>'
+        '<p class="hint">Este resumo considera o plano de corte gerado, não apenas o cálculo por área. Mostra quantas chapas foram usadas, quanto foi aproveitado e quanto ficou de perda em cada tipo de chapa/material.</p>'
+        '<div class="grid">'
+        f'<div class="stat"><span class="hint">Total de chapas no plano</span><br><b>{total_chapas}</b></div>'
+        f'<div class="stat"><span class="hint">Aproveitamento geral do plano</span><br><b>{fmt_num(aproveitamento_total*100,1)}%</b></div>'
+        f'<div class="stat"><span class="hint">Área aproveitada total</span><br><b>{fmt_num(total_area_pecas,3)} m²</b></div>'
+        f'<div class="stat"><span class="hint">Perda total estimada</span><br><b>{fmt_num(total_perda,3)} m²</b></div>'
+        '</div>'
+        '<table><thead><tr>'
+        '<th>Tipo de chapa / material</th><th>Medida chapa</th><th class="num">Chapas</th><th class="num">Peças</th>'
+        '<th class="num">Área peças</th><th class="num">Área chapas</th><th class="num">Perda</th>'
+        '<th class="num">Aproveit. médio</th><th class="num">Melhor chapa</th><th class="num">Pior chapa</th><th>Status</th>'
+        '</tr></thead><tbody>' + "".join(rows) + '</tbody></table></div>'
+    )
+
+
 def html_planos(planos):
     if not planos:
         return ""
-    html = ['<div class="card"><h2>Plano de corte visual</h2><p class="hint">O sistema agora procura oportunidades de sobra: antes de abrir uma nova chapa, ele testa quais peças restantes cabem nos vazios das chapas atuais. Quando 95% não for fisicamente possível pela geometria das peças, ele mostra o melhor resultado encontrado.</p></div>']
+    html = [
+        '<div class="card"><h2>Plano de corte visual</h2>'
+        '<p class="hint">O sistema procura oportunidades de sobra: antes de abrir uma nova chapa, ele testa quais peças restantes cabem nos vazios das chapas atuais. A sequência operacional detalhada foi removida desta tela para deixar o resultado mais leve.</p></div>',
+        resumo_planos_por_tipo_html(planos),
+    ]
     for grupo in planos:
         material = grupo["material"]
         modo = _nome_modo_plano(grupo.get("modo", "encaixe"))
@@ -1869,10 +1953,9 @@ def html_planos(planos):
                 f'<div class="grid"><div class="stat"><span class="hint">Aproveitamento real desta chapa</span><br><b>{fmt_num(ch["aproveitamento"]*100,1)}%</b></div>'
                 f'<div class="stat"><span class="hint">Área das peças</span><br><b>{fmt_num(ch["area_pecas"],3)} m²</b></div>'
                 f'<div class="stat"><span class="hint">Sobra estimada</span><br><b>{fmt_num(ch["sobra_m2"],3)} m²</b></div></div>'
-                f'<div class="svgwrap">{svg_chapa(ch)}</div><h3>Sequência sugerida</h3>'
-                f'<div class="cutseq"><ol>{"".join("<li>"+html_escape(s)+"</li>" for s in ch.get("sequencia", [])[:120])}</ol></div></div>'
+                f'<div class="svgwrap">{svg_chapa(ch)}</div></div>'
             )
-    return "\n".join(html)
+    return "\n".join(x for x in html if x)
 
 def montar_resultado(entradas, itens, resumo, desconhecidos, planos=None, calculo_id=None):
     msg = f'<div class="card"><span class="badge ok">Histórico salvo no cálculo #{calculo_id}</span></div>' if calculo_id else ""
