@@ -863,7 +863,8 @@ def _plano_maxrects_estrategia(pecas, chapa_w, chapa_h, kerf, permite_girar, ord
             pos = _melhor_posicao_maxrects(ch, peca, chapa_w, chapa_h, kerf, permite_girar, criterio)
             if pos is None:
                 continue
-            score_global = (idx, pos[0])
+            ocupada = sum(pp["w_draw"] * pp["h_draw"] for pp in ch.get("pecas", [])) + pos[4] * pos[5]
+            score_global = (pos[0], -ocupada, idx)
             if melhor_pos is None or score_global < melhor_pos[0]:
                 melhor_pos = (score_global, pos)
                 melhor_chapa = ch
@@ -949,20 +950,70 @@ def _plano_shelf_estrategia(pecas, chapa_w, chapa_h, kerf, permite_girar, ordena
     return finalizar_chapas(chapas, chapa_w, chapa_h, "guilhotina", f"Faixas horizontais / {ordenacao}")
 
 
-def _score_plano(chapas, chapa_w, chapa_h):
+def _aproveitamento_plano(chapas, chapa_w, chapa_h):
     area_chapa = chapa_w * chapa_h
     qtd = len(chapas)
     area_total = sum(ch.get("area_pecas", 0.0) for ch in chapas)
-    aproveitamento_geral = area_total / (qtd * area_chapa) if qtd and area_chapa else 0.0
-    pior_chapa = min((ch.get("aproveitamento", 0.0) for ch in chapas), default=0.0)
-    return (qtd, -aproveitamento_geral, -pior_chapa)
+    return area_total / (qtd * area_chapa) if qtd and area_chapa else 0.0
+
+
+def _pior_chapa_plano(chapas):
+    return min((ch.get("aproveitamento", 0.0) for ch in chapas), default=0.0)
+
+
+def _agrupar_niveis(valores, tolerancia=0.008):
+    valores = sorted(float(v) for v in valores)
+    grupos = []
+    for v in valores:
+        if not grupos or abs(v - grupos[-1][-1]) > tolerancia:
+            grupos.append([v])
+        else:
+            grupos[-1].append(v)
+    return [sum(g) / len(g) for g in grupos]
+
+
+def _complexidade_visual_chapa(ch):
+    pecas = ch.get("pecas", [])
+    if not pecas:
+        return 0.0
+    xs = _agrupar_niveis([p["x"] for p in pecas] + [p["x"] + p["w_draw"] for p in pecas])
+    ys = _agrupar_niveis([p["y"] for p in pecas] + [p["y"] + p["h_draw"] for p in pecas])
+    orientacoes = len({(round(p["w_draw"], 3), round(p["h_draw"], 3)) for p in pecas})
+    linhas_topo = len(_agrupar_niveis([p["y"] for p in pecas]))
+    colunas_esq = len(_agrupar_niveis([p["x"] for p in pecas]))
+    return (len(xs) + len(ys)) + 0.7 * orientacoes + 0.8 * linhas_topo + 0.8 * colunas_esq
+
+
+def _complexidade_visual_plano(chapas):
+    return sum(_complexidade_visual_chapa(ch) for ch in chapas)
+
+
+def _score_plano(chapas, chapa_w, chapa_h):
+    qtd = len(chapas)
+    aproveitamento_geral = _aproveitamento_plano(chapas, chapa_w, chapa_h)
+    pior_chapa = _pior_chapa_plano(chapas)
+    complexidade = _complexidade_visual_plano(chapas)
+    return (qtd, -aproveitamento_geral, complexidade, -pior_chapa)
 
 
 def _selecionar_melhor_plano(candidatos, chapa_w, chapa_h):
     candidatos = [c for c in candidatos if c]
     if not candidatos:
         return []
-    return min(candidatos, key=lambda chapas: _score_plano(chapas, chapa_w, chapa_h))
+
+    min_chapas = min(len(c) for c in candidatos)
+    candidatos = [c for c in candidatos if len(c) == min_chapas]
+    melhor_aproveitamento = max(_aproveitamento_plano(c, chapa_w, chapa_h) for c in candidatos)
+    tolerancia_visual = 0.012
+    quase_melhores = [c for c in candidatos if _aproveitamento_plano(c, chapa_w, chapa_h) >= melhor_aproveitamento - tolerancia_visual]
+
+    guilhotina_quase = [c for c in quase_melhores if all(ch.get("modo") == "guilhotina" for ch in c)]
+    if guilhotina_quase:
+        melhor_guilhotina = max(_aproveitamento_plano(c, chapa_w, chapa_h) for c in guilhotina_quase)
+        if melhor_guilhotina >= melhor_aproveitamento - 0.008:
+            return min(guilhotina_quase, key=lambda chapas: (_complexidade_visual_plano(chapas), -_aproveitamento_plano(chapas, chapa_w, chapa_h), -_pior_chapa_plano(chapas)))
+
+    return min(quase_melhores, key=lambda chapas: (_complexidade_visual_plano(chapas), -_aproveitamento_plano(chapas, chapa_w, chapa_h), -_pior_chapa_plano(chapas)))
 
 
 def _metadados_plano(chapas, chapa_w, chapa_h, meta=META_APROVEITAMENTO_PADRAO):
@@ -1302,19 +1353,34 @@ def entradas_do_formulario(form):
     return entradas
 
 
-def svg_chapa(chapa):
-    """Desenha a chapa em SVG usando milímetros como unidade do viewBox.
+def _quebrar_linhas_svg(texto, max_chars=28):
+    texto = str(texto or "").strip()
+    if not texto:
+        return []
+    palavras = texto.split()
+    linhas = []
+    atual = ""
+    for palavra in palavras:
+        tentativa = (atual + " " + palavra).strip()
+        if atual and len(tentativa) > max_chars:
+            linhas.append(atual)
+            atual = palavra
+        else:
+            atual = tentativa
+    if atual:
+        linhas.append(atual)
+    return linhas[:2]
 
-    Isso corrige a aparência torta causada por escalas fracionadas e prende
-    o texto dentro de cada retângulo.
-    """
+
+def svg_chapa(chapa):
+    """Desenha a chapa em SVG com escala estável e visual mais reto/limpo."""
     chapa_w, chapa_h = chapa.get("chapa_w", 2.75), chapa.get("chapa_h", 1.85)
     W = int(round(chapa_w * 1000))
     H = int(round(chapa_h * 1000))
     sid = f"s{chapa.get('numero', 0)}_{abs(hash(str(chapa.get('estrategia','')))) % 99999}"
     parts = [
-        f'<svg class="cut-svg" viewBox="0 0 {W} {H}" xmlns="http://www.w3.org/2000/svg" preserveAspectRatio="xMinYMin meet" shape-rendering="crispEdges">',
-        f'<rect x="0" y="0" width="{W}" height="{H}" fill="#fff" stroke="#111827" stroke-width="4"/>',
+        f'<svg class="cut-svg" viewBox="0 0 {W} {H}" xmlns="http://www.w3.org/2000/svg" preserveAspectRatio="xMidYMid meet" shape-rendering="crispEdges" style="aspect-ratio:{W}/{H}">',
+        f'<rect x="0" y="0" width="{W}" height="{H}" fill="#ffffff" stroke="#0f172a" stroke-width="4" vector-effect="non-scaling-stroke"/>',
     ]
     for i, p in enumerate(chapa.get("pecas", [])):
         x = int(round(float(p["x"]) * 1000))
@@ -1323,17 +1389,39 @@ def svg_chapa(chapa):
         h = max(1, int(round(float(p["h_draw"]) * 1000)))
         clip_id = f"clip_{sid}_{i}"
         codigo = html_escape(p.get("codigo", ""))
-        desc = html_escape(str(p.get("descricao", ""))[:28])
+        desc = html_escape(str(p.get("descricao", "")))
         medida = f"{int(round(float(p['w_draw'])*1000))}x{int(round(float(p['h_draw'])*1000))}"
-        fs = max(18, min(42, int(min(w / 8, h / 4))))
-        fill = cor_hash(p.get("codigo", i))
-        parts.append(f'<clipPath id="{clip_id}"><rect x="{x+3}" y="{y+3}" width="{max(w-6,1)}" height="{max(h-6,1)}"/></clipPath>')
-        parts.append(f'<rect x="{x}" y="{y}" width="{w}" height="{h}" fill="{fill}" stroke="#334155" stroke-width="3"/>')
-        parts.append(f'<g clip-path="url(#{clip_id})">')
-        parts.append(f'<text x="{x+10}" y="{y+fs+8}" font-size="{fs}" font-family="Arial" fill="#111827">{codigo} | {medida}</text>')
-        if h > 120 and w > 220:
-            parts.append(f'<text x="{x+10}" y="{y+(fs*2)+16}" font-size="{max(16, int(fs*0.75))}" font-family="Arial" fill="#334155">{desc}</text>')
-        parts.append('</g>')
+        fill = cor_hash(f"{p.get('codigo', '')}-{i}")
+
+        area_mm2 = w * h
+        if area_mm2 < 90000:
+            fs1, fs2, fs3 = 0, 0, 0
+        elif area_mm2 < 180000:
+            fs1, fs2, fs3 = 15, 0, 0
+        elif area_mm2 < 350000:
+            fs1, fs2, fs3 = 16, 14, 0
+        else:
+            fs1 = max(17, min(32, int(min(w / 12, h / 5))))
+            fs2 = max(15, min(24, int(fs1 * 0.82)))
+            fs3 = max(13, min(20, int(fs1 * 0.72)))
+
+        parts.append(f'<clipPath id="{clip_id}"><rect x="{x+4}" y="{y+4}" width="{max(w-8,1)}" height="{max(h-8,1)}"/></clipPath>')
+        parts.append(f'<rect x="{x}" y="{y}" width="{w}" height="{h}" fill="{fill}" stroke="#475569" stroke-width="3" vector-effect="non-scaling-stroke"/>')
+
+        if fs1 > 0:
+            parts.append(f'<g clip-path="url(#{clip_id})" font-family="Arial, Helvetica, sans-serif" fill="#0f172a">')
+            cy = y + fs1 + 10
+            parts.append(f'<text x="{x+10}" y="{cy}" font-size="{fs1}" font-weight="700">{codigo}</text>')
+            if fs2 > 0:
+                cy += fs2 + 6
+                parts.append(f'<text x="{x+10}" y="{cy}" font-size="{fs2}" font-weight="600">{medida}</text>')
+            if fs3 > 0 and h >= 140 and w >= 180:
+                for linha in _quebrar_linhas_svg(desc, max_chars=max(18, min(34, w // 28))):
+                    cy += fs3 + 5
+                    if cy > y + h - 10:
+                        break
+                    parts.append(f'<text x="{x+10}" y="{cy}" font-size="{fs3}" fill="#334155">{linha}</text>')
+            parts.append('</g>')
     parts.append("</svg>")
     return "".join(parts)
 
@@ -1349,7 +1437,7 @@ def _nome_modo_plano(modo):
 def html_planos(planos):
     if not planos:
         return ""
-    html = ['<div class="card"><h2>Plano de corte visual</h2><p class="hint">O sistema roda múltiplas estratégias e busca atingir 95%. Quando a meta não for possível para a geometria das peças, ele mostra o melhor resultado encontrado.</p></div>']
+    html = ['<div class="card"><h2>Plano de corte visual</h2><p class="hint">O sistema testa várias estratégias, busca a meta de 95% e agora também prioriza planos mais regulares e mais fáceis de cortar. Quando 95% não for fisicamente possível para a geometria das peças, ele mostra o melhor resultado encontrado.</p></div>']
     for grupo in planos:
         material = grupo["material"]
         modo = _nome_modo_plano(grupo.get("modo", "encaixe"))
