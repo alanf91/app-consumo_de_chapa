@@ -135,6 +135,17 @@ def html_escape(x):
     return escape("" if x is None else str(x), quote=True)
 
 
+
+
+def cor_hash(valor):
+    """Gera uma cor pastel estável para cada código/peça no desenho do plano de corte."""
+    texto = str(valor or "PECA")
+    digest = hashlib.md5(texto.encode("utf-8")).hexdigest()
+    r = 180 + (int(digest[0:2], 16) % 55)
+    g = 180 + (int(digest[2:4], 16) % 55)
+    b = 180 + (int(digest[4:6], 16) % 55)
+    return f"#{r:02x}{g:02x}{b:02x}"
+
 def agora_iso():
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
