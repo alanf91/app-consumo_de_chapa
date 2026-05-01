@@ -262,8 +262,18 @@ def conectar():
     return conn
 
 
+def garantir_colunas(conn, tabela, colunas_def):
+    """Garante colunas em tabelas antigas do banco persistente do Render."""
+    existentes = {row[1] for row in conn.execute(f"PRAGMA table_info({tabela})").fetchall()}
+    for coluna, definicao in colunas_def.items():
+        if coluna not in existentes:
+            conn.execute(f"ALTER TABLE {tabela} ADD COLUMN {coluna} {definicao}")
+
+
 def garantir_banco():
     DATA_DIR.mkdir(parents=True, exist_ok=True)
+    precisa_reimportar_base = False
+
     with conectar() as conn:
         conn.execute("""
         CREATE TABLE IF NOT EXISTS pecas (
@@ -281,8 +291,36 @@ def garantir_banco():
             atualizado_em TEXT
         )
         """)
+
+        cols_pecas_antes = {row[1] for row in conn.execute("PRAGMA table_info(pecas)").fetchall()}
+        if "codigo_norm" not in cols_pecas_antes:
+            precisa_reimportar_base = True
+
+        garantir_colunas(conn, "pecas", {
+            "codigo": "TEXT",
+            "codigo_norm": "TEXT",
+            "descricao": "TEXT",
+            "comprimento": "REAL",
+            "largura": "REAL",
+            "espessura_raw": "REAL",
+            "espessura_mm": "INTEGER",
+            "material": "TEXT",
+            "produto": "TEXT",
+            "tipo_material": "TEXT",
+            "atualizado_em": "TEXT",
+        })
+
+        rows_sem_norm = conn.execute("""
+            SELECT id, codigo FROM pecas
+            WHERE (codigo_norm IS NULL OR TRIM(codigo_norm) = '')
+              AND codigo IS NOT NULL AND TRIM(codigo) <> ''
+        """).fetchall()
+        for row in rows_sem_norm:
+            conn.execute("UPDATE pecas SET codigo_norm=? WHERE id=?", (limpar_codigo(row["codigo"]), row["id"]))
+
         conn.execute("CREATE INDEX IF NOT EXISTS idx_pecas_codigo_norm ON pecas(codigo_norm)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_pecas_material ON pecas(material)")
+
         conn.execute("""
         CREATE TABLE IF NOT EXISTS chapas (
             material TEXT PRIMARY KEY,
@@ -294,6 +332,16 @@ def garantir_banco():
             permite_girar INTEGER NOT NULL DEFAULT 1
         )
         """)
+        garantir_colunas(conn, "chapas", {
+            "material": "TEXT",
+            "tipo_material": "TEXT",
+            "comprimento": "REAL NOT NULL DEFAULT 2.75",
+            "largura": "REAL NOT NULL DEFAULT 1.85",
+            "aproveitamento": "REAL NOT NULL DEFAULT 0.95",
+            "kerf_mm": "REAL NOT NULL DEFAULT 4",
+            "permite_girar": "INTEGER NOT NULL DEFAULT 1",
+        })
+
         conn.execute("""
         CREATE TABLE IF NOT EXISTS calculos (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -304,6 +352,14 @@ def garantir_banco():
             desconhecidos_json TEXT
         )
         """)
+        garantir_colunas(conn, "calculos", {
+            "criado_em": "TEXT",
+            "modo": "TEXT",
+            "entradas_json": "TEXT",
+            "resumo_json": "TEXT",
+            "desconhecidos_json": "TEXT",
+        })
+
         conn.execute("""
         CREATE TABLE IF NOT EXISTS calculo_itens (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -319,12 +375,27 @@ def garantir_banco():
             m2_total REAL
         )
         """)
+        garantir_colunas(conn, "calculo_itens", {
+            "calculo_id": "INTEGER",
+            "codigo": "TEXT",
+            "descricao": "TEXT",
+            "material": "TEXT",
+            "produto": "TEXT",
+            "quantidade": "INTEGER",
+            "comprimento": "REAL",
+            "largura": "REAL",
+            "espessura_mm": "INTEGER",
+            "m2_total": "REAL",
+        })
+
         conn.commit()
-        qtd = conn.execute("SELECT COUNT(*) AS c FROM pecas").fetchone()["c"]
+        qtd_validos = conn.execute("""
+            SELECT COUNT(*) AS c FROM pecas
+            WHERE codigo_norm IS NOT NULL AND TRIM(codigo_norm) <> ''
+        """).fetchone()["c"]
 
-    if qtd == 0 and BASE_XLSX_PATH.exists():
+    if (qtd_validos == 0 or precisa_reimportar_base) and BASE_XLSX_PATH.exists():
         importar_base_xlsx(BASE_XLSX_PATH, apagar=True)
-
 
 def detectar_colunas(headers):
     mapa = {normalizar(h): i for i, h in enumerate(headers)}
