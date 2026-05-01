@@ -1,1 +1,1 @@
-# Esta versão usa apenas bibliotecas padrão do Python.
+# Sem dependências externas. O app usa apenas bibliotecas padrão do Python.

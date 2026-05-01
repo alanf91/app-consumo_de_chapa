@@ -1,7 +1,8 @@
 services:
   - type: web
-    name: app-chapas
+    name: app-consumo-de-chapa-codigo-peca
     runtime: python
+    plan: free
     buildCommand: pip install -r requirements.txt
     startCommand: python app.py
     envVars:
@@ -10,4 +11,10 @@ services:
       - key: APP_USER
         value: admin
       - key: APP_PASSWORD
-        sync: false
+        value: troque-esta-senha
+      - key: KERF_MM
+        value: "4"
+      - key: META_APROVEITAMENTO
+        value: "0.95"
+      - key: PERMITE_GIRAR_90
+        value: "1"
