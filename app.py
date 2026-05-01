@@ -823,7 +823,7 @@ def gerar_xlsx_historico():
 # ============================================================
 
 CSS = """
-:root{--bg:#f3f6fb;--card:#fff;--text:#0f1f35;--muted:#53657e;--blue:#1f5eea;--border:#dfe6f0;--danger:#b42318;--ok:#027a48}*{box-sizing:border-box}body{font-family:Arial,Helvetica,sans-serif;margin:0;background:var(--bg);color:var(--text)}.wrap{max-width:1220px;margin:0 auto;padding:20px}.header{display:flex;align-items:center;gap:20px;margin-bottom:18px}.logo-main{height:78px;max-width:260px;object-fit:contain}.header h1{font-size:26px;margin:0 0 4px}.header p{margin:0;color:var(--muted)}.nav{display:flex;gap:10px;flex-wrap:wrap;margin-bottom:18px}.nav a,.btn{display:inline-flex;align-items:center;justify-content:center;border:1px solid var(--border);background:#fff;color:#064ceb;text-decoration:none;border-radius:10px;padding:10px 14px;font-weight:700;cursor:pointer;font-size:14px}.btn.primary{background:var(--blue);color:#fff;border-color:var(--blue)}.card{background:var(--card);border:1px solid var(--border);border-radius:18px;padding:18px;margin:14px 0;box-shadow:0 8px 24px rgba(17,33,61,.06)}.card h2{margin:0 0 16px;font-size:24px}.hint{color:var(--muted);font-size:14px}.row{display:grid;grid-template-columns:180px 1fr 160px 48px;gap:10px;margin:8px 0}.row2{display:grid;grid-template-columns:1fr 1fr 1fr;gap:12px}input,select{width:100%;border:1px solid var(--border);border-radius:10px;padding:11px 12px;font-size:14px;background:#fff}table{width:100%;border-collapse:separate;border-spacing:0;border:1px solid var(--border);border-radius:12px;overflow:hidden;background:#fff}th,td{padding:10px 12px;border-bottom:1px solid var(--border);text-align:left;font-size:14px;vertical-align:top}th{background:#f8fafc;font-weight:800}tr:last-child td{border-bottom:none}.num{text-align:right}.badge{display:inline-block;border-radius:999px;background:#eef2ff;color:#123cbd;padding:4px 8px;font-size:12px}.badge.danger{background:#fee4e2;color:#b42318}.badge.ok{background:#d1fadf;color:#027a48}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:12px}.stat{background:#f8fafc;border:1px solid var(--border);border-radius:14px;padding:14px}.stat b{font-size:24px}.actions{display:flex;gap:10px;flex-wrap:wrap;margin-top:12px}.footer{display:flex;justify-content:center;align-items:center;gap:26px;margin:26px auto 10px;flex-wrap:wrap}.footer img{height:58px;max-width:230px;object-fit:contain;filter:grayscale(.1);opacity:.88}.sheet-card{page-break-inside:avoid}.svgwrap{overflow:auto;border:1px solid var(--border);border-radius:12px;background:#fff;padding:8px}.cutseq{font-size:13px;color:#334155;columns:2}.login{max-width:430px;margin:80px auto}@media print{.nav,.actions,.no-print,.btn{display:none!important}.wrap{max-width:100%;padding:0}.card{box-shadow:none;border:1px solid #999;page-break-inside:avoid}body{background:#fff}}
+:root{--bg:#f3f6fb;--card:#fff;--text:#0f1f35;--muted:#53657e;--blue:#1f5eea;--border:#dfe6f0;--danger:#b42318;--ok:#027a48}*{box-sizing:border-box}body{font-family:Arial,Helvetica,sans-serif;margin:0;background:var(--bg);color:var(--text)}.wrap{max-width:1220px;margin:0 auto;padding:20px}.header{display:flex;align-items:center;gap:20px;margin-bottom:18px}.logo-main{height:78px;max-width:260px;object-fit:contain}.header h1{font-size:26px;margin:0 0 4px}.header p{margin:0;color:var(--muted)}.nav{display:flex;gap:10px;flex-wrap:wrap;margin-bottom:18px}.nav a,.btn{display:inline-flex;align-items:center;justify-content:center;border:1px solid var(--border);background:#fff;color:#064ceb;text-decoration:none;border-radius:10px;padding:10px 14px;font-weight:700;cursor:pointer;font-size:14px}.btn.primary{background:var(--blue);color:#fff;border-color:var(--blue)}.card{background:var(--card);border:1px solid var(--border);border-radius:18px;padding:18px;margin:14px 0;box-shadow:0 8px 24px rgba(17,33,61,.06)}.card h2{margin:0 0 16px;font-size:24px}.hint{color:var(--muted);font-size:14px}.row{display:grid;grid-template-columns:180px 1fr 160px 48px;gap:10px;margin:8px 0}.row2{display:grid;grid-template-columns:1fr 1fr 1fr;gap:12px}input,select,textarea{width:100%;border:1px solid var(--border);border-radius:10px;padding:11px 12px;font-size:14px;background:#fff}textarea{min-height:260px;resize:vertical;font-family:Consolas,Menlo,monospace;line-height:1.45}.paste-grid{display:grid;grid-template-columns:1fr 180px;gap:12px;margin-top:12px}.paste-grid label{display:block;font-weight:800;margin:0 0 7px}.minihelp{background:#f8fafc;border:1px dashed var(--border);border-radius:12px;padding:10px 12px;margin:10px 0;color:#53657e;font-size:13px}.counter{font-size:13px;color:#53657e;margin-top:6px}.toolbar{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-top:10px}table{width:100%;border-collapse:separate;border-spacing:0;border:1px solid var(--border);border-radius:12px;overflow:hidden;background:#fff}th,td{padding:10px 12px;border-bottom:1px solid var(--border);text-align:left;font-size:14px;vertical-align:top}th{background:#f8fafc;font-weight:800}tr:last-child td{border-bottom:none}.num{text-align:right}.badge{display:inline-block;border-radius:999px;background:#eef2ff;color:#123cbd;padding:4px 8px;font-size:12px}.badge.danger{background:#fee4e2;color:#b42318}.badge.ok{background:#d1fadf;color:#027a48}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:12px}.stat{background:#f8fafc;border:1px solid var(--border);border-radius:14px;padding:14px}.stat b{font-size:24px}.actions{display:flex;gap:10px;flex-wrap:wrap;margin-top:12px}.footer{display:flex;justify-content:center;align-items:center;gap:26px;margin:26px auto 10px;flex-wrap:wrap}.footer img{height:58px;max-width:230px;object-fit:contain;filter:grayscale(.1);opacity:.88}.sheet-card{page-break-inside:avoid}.svgwrap{overflow:auto;border:1px solid var(--border);border-radius:12px;background:#fff;padding:8px}.cutseq{font-size:13px;color:#334155;columns:2}.login{max-width:430px;margin:80px auto}@media (max-width:760px){.paste-grid{grid-template-columns:1fr}.row2{grid-template-columns:1fr}}@media print{.nav,.actions,.no-print,.btn{display:none!important}.wrap{max-width:100%;padding:0}.card{box-shadow:none;border:1px solid #999;page-break-inside:avoid}body{background:#fff}}
 """
 
 
@@ -847,15 +847,60 @@ def datalist_codigos():
 
 def pagina_corte(result_html=""):
     pecas, cods, mats = contagens_base()
-    rows = ""
-    for _ in range(6):
-        rows += '<div class="row item-row"><input name="codigo" list="codigos" placeholder="Código da peça"><input placeholder="Descrição será buscada pela base" disabled><input name="quantidade" type="number" min="0" step="1" placeholder="Quantidade"><button type="button" class="btn" onclick="this.closest(\'.item-row\').remove()">×</button></div>'
     corpo = f'''
     <div class="grid"><div class="stat"><span class="hint">Peças cadastradas</span><br><b>{pecas}</b></div><div class="stat"><span class="hint">Códigos únicos</span><br><b>{cods}</b></div><div class="stat"><span class="hint">Materiais</span><br><b>{mats}</b></div></div>
-    <form class="card" method="post" action="/calcular"><h2>Entrada do corte</h2><p class="hint">Informe o <b>código da peça</b> e a <b>quantidade que deve ser cortada</b>. O sistema calcula chapas por material e informa os códigos que não estiverem na base.</p><div class="row" style="font-weight:700"><div>Código da peça</div><div>Descrição</div><div>Quantidade</div><div></div></div><div id="linhas">{rows}</div>{datalist_codigos()}
-    <div class="row2" style="margin-top:12px"><div><label class="hint">Tipo de plano de corte</label><select name="modo_corte"><option value="encaixe">Encaixe livre</option><option value="guilhotina">Guilhotina por faixas</option></select></div><div><label class="hint">Salvar histórico</label><select name="salvar_historico"><option value="1">Sim</option><option value="0">Não</option></select></div><div><label class="hint">Ação</label><select name="acao"><option value="calcular">Apenas calcular consumo</option><option value="plano">Calcular e gerar plano de corte</option></select></div></div>
-    <div class="actions"><button type="button" class="btn" onclick="adicionarLinha()">+ Adicionar código</button><button class="btn primary" type="submit">Executar</button><button type="button" class="btn" onclick="window.print()">Imprimir / salvar PDF</button></div></form>{result_html}
-    <script>function adicionarLinha(){{const div=document.createElement('div');div.className='row item-row';div.innerHTML=`<input name="codigo" list="codigos" placeholder="Código da peça"><input placeholder="Descrição será buscada pela base" disabled><input name="quantidade" type="number" min="0" step="1" placeholder="Quantidade"><button type="button" class="btn" onclick="this.closest('.item-row').remove()">×</button>`;document.getElementById('linhas').appendChild(div);}}</script>
+    <form class="card" method="post" action="/calcular">
+        <h2>Entrada do corte</h2>
+        <p class="hint">Informe os <b>códigos das peças</b> e as <b>quantidades que devem ser cortadas</b>. Agora você pode colar várias linhas direto do Excel.</p>
+        <div class="minihelp"><b>Como colar:</b> copie duas colunas do Excel, por exemplo <b>Código</b> e <b>Quantidade</b>, e cole no campo <b>Códigos da peça</b>. O sistema separa automaticamente as quantidades. Também pode colar uma coluna de códigos e outra coluna de quantidades separadamente.</div>
+        <div class="paste-grid">
+            <div><label for="codigos_texto">Código da peça</label><textarea name="codigos_texto" id="codigos_texto" spellcheck="false" placeholder="Cole aqui vários códigos, um por linha.&#10;Exemplo:&#10;3008002&#10;3008003&#10;3008004"></textarea><div id="contador_codigos" class="counter">0 códigos informados</div></div>
+            <div><label for="quantidades_texto">Quantidade</label><textarea name="quantidades_texto" id="quantidades_texto" spellcheck="false" placeholder="Cole aqui as quantidades, uma por linha.&#10;Exemplo:&#10;40&#10;12&#10;8"></textarea><div id="contador_qtds" class="counter">0 quantidades informadas</div></div>
+        </div>
+        <div class="toolbar no-print"><button type="button" class="btn" onclick="limparEntrada()">Limpar entrada</button><button type="button" class="btn" onclick="exemploEntrada()">Preencher exemplo</button></div>
+        {datalist_codigos()}
+        <div class="row2" style="margin-top:12px"><div><label class="hint">Tipo de plano de corte</label><select name="modo_corte"><option value="encaixe">Encaixe livre</option><option value="guilhotina">Guilhotina por faixas</option></select></div><div><label class="hint">Salvar histórico</label><select name="salvar_historico"><option value="1">Sim</option><option value="0">Não</option></select></div><div><label class="hint">Ação</label><select name="acao"><option value="calcular">Apenas calcular consumo</option><option value="plano">Calcular e gerar plano de corte</option></select></div></div>
+        <div class="actions"><button class="btn primary" type="submit">Executar</button><button type="button" class="btn" onclick="window.print()">Imprimir / salvar PDF</button></div>
+    </form>{result_html}
+    <script>
+    const codigosEl = document.getElementById('codigos_texto');
+    const qtdsEl = document.getElementById('quantidades_texto');
+    function linhasValidas(txt){{return txt.split(/
+?
+/).map(x=>x.trim()).filter(x=>x.length>0);}}
+    function atualizarContadores(){{
+        document.getElementById('contador_codigos').textContent = linhasValidas(codigosEl.value).length + ' códigos informados';
+        document.getElementById('contador_qtds').textContent = linhasValidas(qtdsEl.value).length + ' quantidades informadas';
+    }}
+    function limparEntrada(){{codigosEl.value='';qtdsEl.value='';atualizarContadores();codigosEl.focus();}}
+    function exemploEntrada(){{codigosEl.value='3008002
+3008003
+3008004';qtdsEl.value='40
+12
+8';atualizarContadores();}}
+    codigosEl.addEventListener('paste', function(e){{
+        const texto = (e.clipboardData || window.clipboardData).getData('text');
+        if(texto && (texto.includes('	') || texto.includes(';'))){{
+            e.preventDefault();
+            const codigos=[]; const qtds=[];
+            texto.split(/
+?
+/).forEach(linha=>{{
+                const partes = linha.split(/	|;/).map(p=>p.trim()).filter(Boolean);
+                if(partes.length>=2){{
+                    codigos.push(partes[0]);
+                    qtds.push(partes[partes.length-1]);
+                }} else if(partes.length===1) {{ codigos.push(partes[0]); }}
+            }});
+            codigosEl.value = codigos.join('
+');
+            if(qtds.length) qtdsEl.value = qtds.join('
+');
+            atualizarContadores();
+        }} else {{ setTimeout(atualizarContadores, 0); }}
+    }});
+    codigosEl.addEventListener('input', atualizarContadores); qtdsEl.addEventListener('input', atualizarContadores); atualizarContadores();
+    </script>
     '''
     return layout("Corte por código", corpo, "corte")
 
@@ -886,10 +931,59 @@ def tabela_desconhecidos(desconhecidos):
     return f'<div class="card"><h2>Códigos não encontrados na base</h2><p class="hint">Estes códigos foram informados pelo usuário, mas não existem na planilha-base importada. Eles não entram no cálculo até serem cadastrados na base.</p><table><thead><tr><th>Código</th><th class="num">Quantidade</th><th>Motivo</th></tr></thead><tbody>{rows}</tbody></table></div>'
 
 
-def cor_hash(txt):
-    cores = ["#DBEAFE", "#DCFCE7", "#FEF3C7", "#FCE7F3", "#E0E7FF", "#FFEDD5", "#CCFBF1", "#FEE2E2"]
-    return cores[int(hashlib.md5(str(txt).encode()).hexdigest(), 16) % len(cores)]
+def _linhas_coladas(texto):
+    return [l.strip() for l in str(texto or "").replace("\r\n", "\n").replace("\r", "\n").split("\n") if l.strip()]
 
+
+def _parse_linha_codigo_quantidade(linha):
+    partes = [p.strip() for p in re.split(r"\t|;", str(linha or "")) if p.strip()]
+    if len(partes) < 2:
+        return None
+    codigo = partes[0]
+    qtd = ""
+    for ptxt in reversed(partes[1:]):
+        if numero(ptxt, -1) >= 0:
+            qtd = ptxt
+            break
+    if not qtd:
+        qtd = partes[-1]
+    return {"codigo": codigo, "quantidade": qtd}
+
+
+def entradas_do_formulario(form):
+    """Aceita entrada em bloco colada do Excel e mantém compatibilidade com os campos antigos."""
+    entradas = []
+    codigos_texto = form.get("codigos_texto", [""])[0]
+    quantidades_texto = form.get("quantidades_texto", [""])[0]
+    linhas_codigos = _linhas_coladas(codigos_texto)
+    linhas_qtds = _linhas_coladas(quantidades_texto)
+
+    if linhas_codigos:
+        if not linhas_qtds and any(("\t" in l or ";" in l) for l in linhas_codigos):
+            for linha in linhas_codigos:
+                item = _parse_linha_codigo_quantidade(linha)
+                if item:
+                    entradas.append(item)
+                else:
+                    entradas.append({"codigo": linha, "quantidade": ""})
+        else:
+            maior = max(len(linhas_codigos), len(linhas_qtds))
+            for i in range(maior):
+                codigo = linhas_codigos[i] if i < len(linhas_codigos) else ""
+                qtd = linhas_qtds[i] if i < len(linhas_qtds) else ""
+                item_linha = _parse_linha_codigo_quantidade(codigo)
+                if item_linha and not str(qtd).strip():
+                    codigo, qtd = item_linha["codigo"], item_linha["quantidade"]
+                if str(codigo).strip() or str(qtd).strip():
+                    entradas.append({"codigo": codigo, "quantidade": qtd})
+
+    codigos = form.get("codigo", [])
+    quantidades = form.get("quantidade", [])
+    for c, q in zip(codigos, quantidades):
+        if str(c).strip() or str(q).strip():
+            entradas.append({"codigo": c, "quantidade": q})
+
+    return entradas
 
 def svg_chapa(chapa):
     chapa_w, chapa_h = chapa.get("chapa_w", 2.75), chapa.get("chapa_h", 1.85)
@@ -1025,8 +1119,7 @@ class App(BaseHTTPRequestHandler):
             return
         if not self.exigir_auth(): return
         if path == "/calcular":
-            form = self.body_form(); codigos = form.get("codigo", []); quantidades = form.get("quantidade", [])
-            entradas = [{"codigo": c, "quantidade": q} for c, q in zip(codigos, quantidades) if str(c).strip() or str(q).strip()]
+            form = self.body_form(); entradas = entradas_do_formulario(form)
             modo = form.get("modo_corte", ["encaixe"])[0]; acao = form.get("acao", ["calcular"])[0]; salvar = form.get("salvar_historico", ["1"])[0] == "1"
             try:
                 itens, resumo, desconhecidos = calcular_por_codigos(entradas)
