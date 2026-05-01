@@ -628,6 +628,52 @@ def expandir_itens_para_plano(itens, material):
     return pecas
 
 
+def _rect_intersect(a, b):
+    return not (
+        a["x"] + a["w"] <= b["x"] + 1e-9 or
+        b["x"] + b["w"] <= a["x"] + 1e-9 or
+        a["y"] + a["h"] <= b["y"] + 1e-9 or
+        b["y"] + b["h"] <= a["y"] + 1e-9
+    )
+
+
+def _rect_contem(a, b):
+    """Retorna True se o retângulo a contém totalmente o retângulo b."""
+    return (
+        b["x"] >= a["x"] - 1e-9 and
+        b["y"] >= a["y"] - 1e-9 and
+        b["x"] + b["w"] <= a["x"] + a["w"] + 1e-9 and
+        b["y"] + b["h"] <= a["y"] + a["h"] + 1e-9
+    )
+
+
+def _prunar_livres(livres, min_dim=0.01):
+    """Remove retângulos livres pequenos, duplicados ou contidos em outros.
+
+    Esta etapa evita áreas livres sobrepostas que causavam aproveitamento acima
+    de 100% e peças sobrepostas no desenho.
+    """
+    filtrados = []
+    for r in livres:
+        if r["w"] <= min_dim or r["h"] <= min_dim:
+            continue
+        rr = {"x": round(r["x"], 6), "y": round(r["y"], 6), "w": round(r["w"], 6), "h": round(r["h"], 6)}
+        if rr["w"] <= min_dim or rr["h"] <= min_dim:
+            continue
+        filtrados.append(rr)
+
+    saida = []
+    for i, r in enumerate(filtrados):
+        contido = False
+        for j, o in enumerate(filtrados):
+            if i != j and _rect_contem(o, r):
+                contido = True
+                break
+        if not contido and r not in saida:
+            saida.append(r)
+    return sorted(saida, key=lambda r: (r["y"], r["x"], r["w"] * r["h"]))
+
+
 def escolher_orientacao(peca, rect, permite_girar):
     opcoes = [(peca["w"], peca["h"], False)]
     if permite_girar and abs(peca["w"] - peca["h"]) > 1e-9:
@@ -635,104 +681,175 @@ def escolher_orientacao(peca, rect, permite_girar):
     ok = [o for o in opcoes if o[0] <= rect["w"] + 1e-9 and o[1] <= rect["h"] + 1e-9]
     if not ok:
         return None
-    return min(ok, key=lambda o: (rect["w"] - o[0]) * (rect["h"] - o[1]))
+    return min(ok, key=lambda o: (min(rect["w"] - o[0], rect["h"] - o[1]), (rect["w"] * rect["h"]) - (o[0] * o[1])))
+
+
+def _validar_chapa_sem_sobreposicao(chapa, chapa_w, chapa_h):
+    """Validação defensiva: nenhuma peça pode sair da chapa ou sobrepor outra."""
+    pecas = chapa.get("pecas", [])
+    for i, p in enumerate(pecas):
+        if p["x"] < -1e-9 or p["y"] < -1e-9 or p["x"] + p["w_draw"] > chapa_w + 1e-9 or p["y"] + p["h_draw"] > chapa_h + 1e-9:
+            raise ValueError(f"Erro no plano: peça {p.get('codigo','')} ficou fora da chapa.")
+        a = {"x": p["x"], "y": p["y"], "w": p["w_draw"], "h": p["h_draw"]}
+        for j in range(i + 1, len(pecas)):
+            q = pecas[j]
+            b = {"x": q["x"], "y": q["y"], "w": q["w_draw"], "h": q["h_draw"]}
+            if _rect_intersect(a, b):
+                raise ValueError(f"Erro no plano: peças {p.get('codigo','')} e {q.get('codigo','')} ficaram sobrepostas.")
 
 
 def finalizar_chapas(chapas, chapa_w, chapa_h, modo):
     area = chapa_w * chapa_h
     for i, ch in enumerate(chapas, 1):
+        _validar_chapa_sem_sobreposicao(ch, chapa_w, chapa_h)
         a = sum(p["w_draw"] * p["h_draw"] for p in ch["pecas"])
-        ch.update({"numero": i, "area_pecas": a, "aproveitamento": a / area if area else 0, "sobra_m2": max(area - a, 0), "modo": modo, "chapa_w": chapa_w, "chapa_h": chapa_h})
+        aproveitamento = a / area if area else 0
+        if aproveitamento > 1.0001:
+            raise ValueError(f"Erro no plano da chapa {i}: aproveitamento calculado acima de 100%. Revise medidas/algoritmo.")
+        ch.update({
+            "numero": i,
+            "area_pecas": a,
+            "aproveitamento": aproveitamento,
+            "sobra_m2": max(area - a, 0),
+            "modo": modo,
+            "chapa_w": chapa_w,
+            "chapa_h": chapa_h,
+        })
     return chapas
 
 
+def _colocar_peca_maxrects(ch, peca, chapa_w, chapa_h, kerf, permite_girar):
+    melhor = None
+    for rect in ch["livres"]:
+        ori = escolher_orientacao(peca, rect, permite_girar)
+        if not ori:
+            continue
+        w, h, girada = ori
+        sobra_w = rect["w"] - w
+        sobra_h = rect["h"] - h
+        score = (min(sobra_w, sobra_h), max(sobra_w, sobra_h), rect["w"] * rect["h"] - w * h)
+        if melhor is None or score < melhor[0]:
+            melhor = (score, rect, w, h, girada)
+    if melhor is None:
+        return False
+
+    _, rect, w, h, girada = melhor
+    x, y = rect["x"], rect["y"]
+    p = dict(peca)
+    p.update({"x": x, "y": y, "w_draw": w, "h_draw": h, "girada": girada})
+    ch["pecas"].append(p)
+    ch["sequencia"].append(
+        f"Encaixar código {p['codigo']} em X={int(round(x*1000))} mm / Y={int(round(y*1000))} mm, "
+        f"medida {int(round(w*1000))} x {int(round(h*1000))} mm."
+    )
+
+    # O retângulo ocupado inclui a perda de serra para criar distância entre peças.
+    # Na borda da chapa não é necessário reservar kerf para fora da chapa.
+    occ = {
+        "x": x,
+        "y": y,
+        "w": min(w + kerf, chapa_w - x),
+        "h": min(h + kerf, chapa_h - y),
+    }
+
+    novos_livres = []
+    for fr in ch["livres"]:
+        if not _rect_intersect(fr, occ):
+            novos_livres.append(fr)
+            continue
+
+        if occ["x"] > fr["x"] + 1e-9:
+            novos_livres.append({"x": fr["x"], "y": fr["y"], "w": occ["x"] - fr["x"], "h": fr["h"]})
+        fr_right = fr["x"] + fr["w"]
+        occ_right = occ["x"] + occ["w"]
+        if occ_right < fr_right - 1e-9:
+            novos_livres.append({"x": occ_right, "y": fr["y"], "w": fr_right - occ_right, "h": fr["h"]})
+        if occ["y"] > fr["y"] + 1e-9:
+            novos_livres.append({"x": fr["x"], "y": fr["y"], "w": fr["w"], "h": occ["y"] - fr["y"]})
+        fr_bottom = fr["y"] + fr["h"]
+        occ_bottom = occ["y"] + occ["h"]
+        if occ_bottom < fr_bottom - 1e-9:
+            novos_livres.append({"x": fr["x"], "y": occ_bottom, "w": fr["w"], "h": fr_bottom - occ_bottom})
+
+    ch["livres"] = _prunar_livres(novos_livres, min_dim=max(kerf, 0.005))
+    return True
+
+
 def plano_encaixe_livre(pecas, chapa_w, chapa_h, kerf, permite_girar):
-    pecas = sorted(pecas, key=lambda p: p["w"] * p["h"], reverse=True)
+    """Plano por encaixe livre com MaxRects simplificado e validação anti-sobreposição.
+
+    Corrige o problema de aproveitamento acima de 100% causado por retângulos
+    livres sobrepostos na versão anterior.
+    """
+    pecas = sorted(pecas, key=lambda p: (p["w"] * p["h"], max(p["w"], p["h"])), reverse=True)
     chapas = []
+
     def nova_chapa():
         return {"pecas": [], "livres": [{"x": 0.0, "y": 0.0, "w": chapa_w, "h": chapa_h}], "sequencia": []}
+
     for peca in pecas:
+        if not escolher_orientacao(peca, {"x": 0.0, "y": 0.0, "w": chapa_w, "h": chapa_h}, permite_girar):
+            raise ValueError(f"Peça código {peca['codigo']} não cabe na chapa {int(chapa_w*1000)} x {int(chapa_h*1000)} mm.")
+
         colocado = False
         for ch in chapas:
-            melhor = None
-            for ri, rect in enumerate(ch["livres"]):
-                ori = escolher_orientacao(peca, rect, permite_girar)
-                if ori:
-                    w, h, girada = ori
-                    score = rect["w"] * rect["h"] - w * h
-                    if melhor is None or score < melhor[0]:
-                        melhor = (score, ri, rect, w, h, girada)
-            if melhor:
-                _, ri, rect, w, h, girada = melhor
-                x, y = rect["x"], rect["y"]
-                p = dict(peca); p.update({"x": x, "y": y, "w_draw": w, "h_draw": h, "girada": girada})
-                ch["pecas"].append(p)
-                ch["sequencia"].append(f"Encaixar código {p['codigo']} em X={int(round(x*1000))} mm / Y={int(round(y*1000))} mm, medida {int(round(w*1000))} x {int(round(h*1000))} mm.")
-                ch["livres"].pop(ri)
-                rem_right_w = rect["w"] - w - kerf
-                rem_bottom_h = rect["h"] - h - kerf
-                if rem_right_w > 0.02:
-                    ch["livres"].append({"x": x + w + kerf, "y": y, "w": rem_right_w, "h": h})
-                if rem_bottom_h > 0.02:
-                    ch["livres"].append({"x": x, "y": y + h + kerf, "w": rect["w"], "h": rem_bottom_h})
-                ch["livres"] = sorted(ch["livres"], key=lambda r: (r["y"], r["x"], -r["w"] * r["h"]))
+            if _colocar_peca_maxrects(ch, peca, chapa_w, chapa_h, kerf, permite_girar):
                 colocado = True
                 break
         if not colocado:
-            ch = nova_chapa(); rect = ch["livres"][0]
-            ori = escolher_orientacao(peca, rect, permite_girar)
-            if not ori:
-                raise ValueError(f"Peça código {peca['codigo']} não cabe na chapa {int(chapa_w*1000)} x {int(chapa_h*1000)} mm.")
-            w, h, girada = ori
-            p = dict(peca); p.update({"x": 0.0, "y": 0.0, "w_draw": w, "h_draw": h, "girada": girada})
-            ch["pecas"].append(p)
-            if chapa_w - w - kerf > 0.02:
-                ch["livres"].append({"x": w + kerf, "y": 0.0, "w": chapa_w - w - kerf, "h": h})
-            if chapa_h - h - kerf > 0.02:
-                ch["livres"].append({"x": 0.0, "y": h + kerf, "w": chapa_w, "h": chapa_h - h - kerf})
-            ch["sequencia"].append(f"Abrir nova chapa e encaixar código {p['codigo']} na origem, medida {int(round(w*1000))} x {int(round(h*1000))} mm.")
+            ch = nova_chapa()
+            _colocar_peca_maxrects(ch, peca, chapa_w, chapa_h, kerf, permite_girar)
+            ch["sequencia"].insert(0, "Abrir nova chapa.")
             chapas.append(ch)
+
     return finalizar_chapas(chapas, chapa_w, chapa_h, "encaixe")
 
 
 def plano_guilhotina_faixas(pecas, chapa_w, chapa_h, kerf, permite_girar):
-    pecas = sorted(pecas, key=lambda p: p["w"] * p["h"], reverse=True)
+    pecas = sorted(pecas, key=lambda p: (p["w"] * p["h"], max(p["w"], p["h"])), reverse=True)
     chapas, ch = [], {"pecas": [], "faixas": [], "sequencia": []}
+
     def iniciar_faixa(ch, y, h):
         faixa = {"y": y, "h": h, "x": 0.0, "pecas": []}
         ch["faixas"].append(faixa)
         ch["sequencia"].append(f"Cortar faixa guilhotinada de {int(round(h*1000))} mm a partir de Y={int(round(y*1000))} mm.")
         return faixa
+
     for peca in pecas:
         colocado = False
         for faixa in ch["faixas"]:
             opcoes = [(peca["w"], peca["h"], False)]
-            if permite_girar:
+            if permite_girar and abs(peca["w"] - peca["h"]) > 1e-9:
                 opcoes.append((peca["h"], peca["w"], True))
             opcoes = [o for o in opcoes if o[1] <= faixa["h"] + 1e-9 and faixa["x"] + o[0] <= chapa_w + 1e-9]
             if opcoes:
                 w, h, girada = min(opcoes, key=lambda o: (faixa["h"] - o[1], chapa_w - (faixa["x"] + o[0])))
                 x = faixa["x"]
                 p = dict(peca); p.update({"x": x, "y": faixa["y"], "w_draw": w, "h_draw": h, "girada": girada})
-                ch["pecas"].append(p); faixa["pecas"].append(p); faixa["x"] += w + kerf
+                ch["pecas"].append(p); faixa["pecas"].append(p)
+                faixa["x"] = x + w + kerf
                 ch["sequencia"].append(f"Na faixa {int(round(faixa['h']*1000))} mm, cortar código {p['codigo']} com {int(round(w*1000))} x {int(round(h*1000))} mm.")
                 colocado = True
                 break
         if colocado:
             continue
+
         opcoes_nova = [(peca["w"], peca["h"], False)]
-        if permite_girar:
+        if permite_girar and abs(peca["w"] - peca["h"]) > 1e-9:
             opcoes_nova.append((peca["h"], peca["w"], True))
         opcoes_nova = [o for o in opcoes_nova if o[0] <= chapa_w + 1e-9 and o[1] <= chapa_h + 1e-9]
         if not opcoes_nova:
             raise ValueError(f"Peça código {peca['codigo']} não cabe na chapa {int(chapa_w*1000)} x {int(chapa_h*1000)} mm.")
-        w, h, girada = min(opcoes_nova, key=lambda o: o[1])
+        w, h, girada = min(opcoes_nova, key=lambda o: (o[1], -o[0]))
         y_usado = 0.0
         if ch["faixas"]:
             ult = ch["faixas"][-1]
             y_usado = ult["y"] + ult["h"] + kerf
         if y_usado + h > chapa_h + 1e-9:
-            chapas.append(ch); ch = {"pecas": [], "faixas": [], "sequencia": []}; y_usado = 0.0
+            if ch["pecas"]:
+                chapas.append(ch)
+            ch = {"pecas": [], "faixas": [], "sequencia": []}
+            y_usado = 0.0
         faixa = iniciar_faixa(ch, y_usado, h)
         p = dict(peca); p.update({"x": 0.0, "y": y_usado, "w_draw": w, "h_draw": h, "girada": girada})
         ch["pecas"].append(p); faixa["pecas"].append(p); faixa["x"] = w + kerf
@@ -1066,7 +1183,7 @@ def pagina_historico():
 
 
 class App(BaseHTTPRequestHandler):
-    server_version = "AppCortePorCodigo/2.0"
+    server_version = "AppCortePorCodigo/2.1"
     def log_message(self, fmt, *args):
         print("[%s] %s" % (self.log_date_time_string(), fmt % args))
     def enviar(self, html, status=200, content_type="text/html; charset=utf-8"):
