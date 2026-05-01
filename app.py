@@ -270,27 +270,73 @@ def garantir_colunas(conn, tabela, colunas_def):
             conn.execute(f"ALTER TABLE {tabela} ADD COLUMN {coluna} {definicao}")
 
 
+PECAS_COLUNAS_ESPERADAS = {
+    "id", "codigo", "codigo_norm", "descricao", "comprimento", "largura",
+    "espessura_raw", "espessura_mm", "material", "produto", "tipo_material", "atualizado_em"
+}
+
+
+def criar_tabela_pecas(conn):
+    conn.execute("""
+    CREATE TABLE IF NOT EXISTS pecas (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        codigo TEXT,
+        codigo_norm TEXT,
+        descricao TEXT,
+        comprimento REAL,
+        largura REAL,
+        espessura_raw REAL,
+        espessura_mm INTEGER,
+        material TEXT,
+        produto TEXT,
+        tipo_material TEXT,
+        atualizado_em TEXT
+    )
+    """)
+
+
+def tabela_pecas_incompativel(conn):
+    """Detecta bancos antigos do sistema por produto.
+
+    No Render, o SQLite pode ficar salvo no disco persistente com colunas antigas,
+    por exemplo produto_agrupado NOT NULL. A nova versão trabalha por código da peça.
+    Se a tabela antiga tiver colunas obrigatórias extras, o INSERT da nova base falha.
+    Nesse caso, recriamos somente a tabela pecas e reimportamos a planilha base_pecas.xlsx.
+    """
+    info = conn.execute("PRAGMA table_info(pecas)").fetchall()
+    if not info:
+        return False
+    nomes = {row[1] for row in info}
+    if "produto_agrupado" in nomes or "qtde_peca_produto" in nomes or "tipo_chapa" in nomes:
+        return True
+    for row in info:
+        nome = row[1]
+        notnull = bool(row[3])
+        default = row[4]
+        pk = bool(row[5])
+        if nome not in PECAS_COLUNAS_ESPERADAS and notnull and default is None and not pk:
+            return True
+    return False
+
+
+def resetar_tabela_pecas(conn):
+    conn.execute("DROP INDEX IF EXISTS idx_pecas_codigo_norm")
+    conn.execute("DROP INDEX IF EXISTS idx_pecas_material")
+    conn.execute("DROP TABLE IF EXISTS pecas")
+    criar_tabela_pecas(conn)
+
+
 def garantir_banco():
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     precisa_reimportar_base = False
 
     with conectar() as conn:
-        conn.execute("""
-        CREATE TABLE IF NOT EXISTS pecas (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            codigo TEXT,
-            codigo_norm TEXT,
-            descricao TEXT,
-            comprimento REAL,
-            largura REAL,
-            espessura_raw REAL,
-            espessura_mm INTEGER,
-            material TEXT,
-            produto TEXT,
-            tipo_material TEXT,
-            atualizado_em TEXT
-        )
-        """)
+        criar_tabela_pecas(conn)
+
+        if tabela_pecas_incompativel(conn):
+            print("[MIGRACAO] Banco antigo detectado. Recriando tabela pecas para a nova logica por codigo.")
+            resetar_tabela_pecas(conn)
+            precisa_reimportar_base = True
 
         cols_pecas_antes = {row[1] for row in conn.execute("PRAGMA table_info(pecas)").fetchall()}
         if "codigo_norm" not in cols_pecas_antes:
