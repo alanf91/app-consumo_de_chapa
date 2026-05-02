@@ -1505,7 +1505,7 @@ def _grupos_uniformes(pecas, ordenacao="area_desc"):
     for p in pecas:
         chave = _chave_grupo_uniforme(p)
         if chave not in grupos_map:
-            grupos_map[chave] = {"peca": dict(p), "count": 0, "orientacao": None, "chave": chave}
+            grupos_map[chave] = {"peca": dict(p), "count": 0, "orientacao": None, "orientacao_secundaria_usada": False, "chave": chave}
             ordem.append(chave)
         grupos_map[chave]["count"] += 1
     grupos = [grupos_map[k] for k in ordem]
@@ -1531,10 +1531,30 @@ def _grupos_uniformes(pecas, ordenacao="area_desc"):
     return grupos
 
 
-def _orientacoes_grupo_uniforme(grupo, permite_girar):
-    if grupo.get("orientacao") is not None:
-        return [grupo["orientacao"]]
-    return _orientacoes_possiveis(grupo["peca"], permite_girar)
+def _orientacoes_grupo_uniforme(grupo, permite_girar, permitir_secundaria=False):
+    """Retorna orientações permitidas para o grupo.
+
+    Regra nova:
+    - orientação principal continua sendo a padrão do grupo;
+    - rotação 90° secundária é permitida de forma controlada para aproveitar
+      faixas laterais/inferiores, mas sem espalhar peças iguais em várias
+      orientações aleatórias.
+    """
+    if grupo.get("orientacao") is None:
+        return _orientacoes_possiveis(grupo["peca"], permite_girar)
+
+    base = [grupo["orientacao"]]
+    if not permitir_secundaria or not permite_girar:
+        return base
+
+    w, h, girada = grupo["orientacao"]
+    if abs(w - h) < 1e-9:
+        return base
+    if grupo.get("orientacao_secundaria_usada"):
+        return base
+
+    secundaria = (h, w, not girada)
+    return base + [secundaria]
 
 
 def _capacidade_bloco_uniforme(rect, w, h, kerf, restante):
@@ -1574,20 +1594,58 @@ def _melhor_bloco_uniforme(chapas, grupo, chapa_w, chapa_h, kerf, permite_girar)
     restante = int(grupo.get("count", 0))
     if restante <= 0:
         return None
+
+    orient_principal = grupo.get("orientacao")
+
     for ci, ch in enumerate(chapas):
         for ri, rect in enumerate(ch.get("livres", [])):
-            for w, h, girada in _orientacoes_grupo_uniforme(grupo, permite_girar):
+            # rotação secundária só entra quando o retângulo livre tem cara de faixa/sobra
+            eh_faixa = rect["w"] < chapa_w * 0.34 or rect["h"] < chapa_h * 0.34 or rect["x"] > 0 or rect["y"] > 0
+            for w, h, girada in _orientacoes_grupo_uniforme(grupo, permite_girar, permitir_secundaria=eh_faixa):
                 cap = _capacidade_bloco_uniforme(rect, w, h, kerf, restante)
                 if not cap:
                     continue
-                # Pontuação: prioriza encaixar muitas peças iguais juntas,
-                # alta densidade, origem superior/esquerda e pouca sobra no retângulo livre.
+
+                secundaria = False
+                if orient_principal is not None and (abs(w - orient_principal[0]) > 1e-9 or abs(h - orient_principal[1]) > 1e-9):
+                    secundaria = True
+
                 sobra_ret = (rect["w"] * rect["h"]) - (cap["bloco_w"] * cap["bloco_h"])
                 encosta = 0
                 if abs(rect["x"]) < 1e-9: encosta += 1
                 if abs(rect["y"]) < 1e-9: encosta += 1
-                score = (-cap["qtd"], -cap["densidade"], -encosta, sobra_ret, rect["y"], rect["x"], ci)
-                cand = (score, ci, ri, rect, w, h, girada, cap)
+                if abs((rect["x"] + rect["w"]) - chapa_w) < 1e-9: encosta += 1
+                if abs((rect["y"] + rect["h"]) - chapa_h) < 1e-9: encosta += 1
+
+                # fill ratio do bloco dentro do retângulo livre
+                fill_rect = (cap["bloco_w"] * cap["bloco_h"]) / (rect["w"] * rect["h"]) if rect["w"] * rect["h"] else 0.0
+
+                # penalidade forte para orientação secundária, mas liberada quando ela realmente resolve uma faixa.
+                penal_secundaria = 0
+                if secundaria:
+                    penal_secundaria = 1000000
+                    if eh_faixa and fill_rect >= 0.72:
+                        penal_secundaria = 1500
+                    elif eh_faixa and fill_rect >= 0.58:
+                        penal_secundaria = 5000
+
+                # bônus para deixar o retângulo livre mais "limpo"
+                residuo_w = max(0.0, rect["w"] - cap["bloco_w"])
+                residuo_h = max(0.0, rect["h"] - cap["bloco_h"])
+                penal_residuo_ruim = 0 if min(residuo_w, residuo_h) < 0.08 else 1
+
+                score = (
+                    penal_secundaria,
+                    -cap["qtd"],
+                    -cap["densidade"],
+                    penal_residuo_ruim,
+                    sobra_ret,
+                    -encosta,
+                    rect["y"],
+                    rect["x"],
+                    ci,
+                )
+                cand = (score, ci, ri, rect, w, h, girada, cap, secundaria)
                 if melhor is None or cand[0] < melhor[0]:
                     melhor = cand
     return melhor
@@ -1597,6 +1655,11 @@ def _inserir_bloco_uniforme(ch, grupo, rect, w, h, girada, cap, chapa_w, chapa_h
     qtd = int(cap["qtd"])
     cols = int(cap["cols"])
     x0, y0 = float(rect["x"]), float(rect["y"])
+    orient_principal = grupo.get("orientacao")
+    secundaria = False
+    if orient_principal is not None and (abs(w - orient_principal[0]) > 1e-9 or abs(h - orient_principal[1]) > 1e-9):
+        secundaria = True
+
     for n in range(qtd):
         lin = n // cols
         col = n % cols
@@ -1607,11 +1670,16 @@ def _inserir_bloco_uniforme(ch, grupo, rect, w, h, girada, cap, chapa_w, chapa_h
             "w_draw": w,
             "h_draw": h,
             "girada": girada,
+            "bloco_uniforme": True,
+            "orientacao_secundaria": secundaria,
         })
         ch.setdefault("pecas", []).append(p)
     grupo["count"] -= qtd
     if grupo.get("orientacao") is None:
         grupo["orientacao"] = (w, h, girada)
+    elif secundaria:
+        grupo["orientacao_secundaria_usada"] = True
+
     usado = {
         "x": x0,
         "y": y0,
@@ -1619,7 +1687,11 @@ def _inserir_bloco_uniforme(ch, grupo, rect, w, h, girada, cap, chapa_w, chapa_h
         "h": min(cap["bloco_h"] + kerf, chapa_h - y0),
     }
     ch["livres"] = _split_free_rectangles(ch.get("livres", []), usado, min_dim=max(kerf, 0.003))
-    adicionar_sequencia(ch, f"Bloco uniforme: código {grupo['peca'].get('codigo','')} com {qtd} peça(s), orientação {int(round(w*1000))} x {int(round(h*1000))} mm.")
+    texto_orient = f"{int(round(w*1000))} x {int(round(h*1000))} mm"
+    if secundaria:
+        adicionar_sequencia(ch, f"Bloco complementar: código {grupo['peca'].get('codigo','')} com {qtd} peça(s), rotação 90° controlada, orientação {texto_orient}.")
+    else:
+        adicionar_sequencia(ch, f"Bloco uniforme: código {grupo['peca'].get('codigo','')} com {qtd} peça(s), orientação {texto_orient}.")
 
 
 def _plano_industrial_uniforme_estrategia(pecas, chapa_w, chapa_h, kerf, permite_girar, ordenacao="area_desc"):
@@ -1651,11 +1723,11 @@ def _plano_industrial_uniforme_estrategia(pecas, chapa_w, chapa_h, kerf, permite
                     if melhor is None:
                         raise ValueError(f"Peça código {grupo['peca'].get('codigo','')} não cabe na chapa {int(chapa_w*1000)} x {int(chapa_h*1000)} mm.")
                     # ajustar índice local para índice real da chapa recém-criada
-                    _, _, ri, rect, w, h, girada, cap = melhor
+                    _, _, ri, rect, w, h, girada, cap, secundaria = melhor
                     _inserir_bloco_uniforme(chapas[-1], grupo, rect, w, h, girada, cap, chapa_w, chapa_h, kerf)
                     progresso = True
                 else:
-                    _, ci, ri, rect, w, h, girada, cap = melhor
+                    _, ci, ri, rect, w, h, girada, cap, secundaria = melhor
                     _inserir_bloco_uniforme(chapas[ci], grupo, rect, w, h, girada, cap, chapa_w, chapa_h, kerf)
                     progresso = True
                 # Evita laço pesado demais em Render; o plano continua estável.
@@ -2314,7 +2386,7 @@ def html_planos(planos):
         return ""
     html = [
         '<div class="card"><h2>Plano de corte visual</h2>'
-        '<p class="hint">O modo recomendado agora é Industrial uniforme: peças iguais ficam agrupadas em blocos/faixas e com a mesma orientação, evitando planos bagunçados. O sistema ainda usa sobras, mas sem espalhar peças iguais aleatoriamente.</p></div>',
+        '<p class="hint">O modo recomendado agora é Industrial uniforme: peças iguais ficam agrupadas em blocos/faixas e com a mesma orientação. A nova versão também permite rotação 90° controlada apenas para preencher faixas de sobra, sem bagunçar o plano.</p></div>',
         resumo_planos_por_tipo_html(planos),
     ]
     for grupo in planos:
