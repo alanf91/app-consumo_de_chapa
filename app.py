@@ -1733,52 +1733,105 @@ def _inserir_bloco_uniforme(ch, grupo, rect, w, h, girada, cap, chapa_w, chapa_h
         adicionar_sequencia(ch, f"Bloco uniforme: código {grupo['peca'].get('codigo','')} com {qtd} peça(s), orientação {texto_orient}.")
 
 
-def _plano_industrial_uniforme_estrategia(pecas, chapa_w, chapa_h, kerf, permite_girar, ordenacao="area_desc"):
-    """Plano industrial: mantém peças iguais agrupadas e com orientação uniforme.
+def _melhor_bloco_global_na_chapa(ch, grupos, chapa_w, chapa_h, kerf, permite_girar, primeiro_bloco=False):
+    """Escolhe o próximo bloco entre todos os códigos restantes para a chapa atual.
 
-    Esta lógica evita a 'bagunça' visual: peças de mesmo código não ficam
-    espalhadas/rotacionadas aleatoriamente. O algoritmo monta blocos regulares
-    e usa as sobras para inserir outros blocos, não peças soltas.
+    Esta é a correção principal: quando a quantidade de um código acaba,
+    o algoritmo continua preenchendo a mesma chapa com outros códigos que
+    ainda faltam cortar, antes de abrir outra chapa.
+    """
+    melhor_global = None
+
+    # No primeiro bloco da chapa, mantenha a ordem industrial: peças maiores/mais importantes primeiro.
+    if primeiro_bloco:
+        for gi, grupo in enumerate(grupos):
+            if int(grupo.get("count", 0)) <= 0:
+                continue
+            cand = _melhor_bloco_uniforme([ch], grupo, chapa_w, chapa_h, kerf, permite_girar)
+            if cand is not None:
+                score, ci, ri, rect, w, h, girada, cap, secundaria = cand
+                return (score, gi, grupo, rect, w, h, girada, cap, secundaria)
+        return None
+
+    for gi, grupo in enumerate(grupos):
+        if int(grupo.get("count", 0)) <= 0:
+            continue
+        cand = _melhor_bloco_uniforme([ch], grupo, chapa_w, chapa_h, kerf, permite_girar)
+        if cand is None:
+            continue
+        score, ci, ri, rect, w, h, girada, cap, secundaria = cand
+
+        # Ajuste global: depois que a chapa já tem peças, priorize preencher
+        # os espaços livres existentes com qualquer código restante que caiba.
+        area_bloco = cap["qtd"] * w * h
+        area_livre = rect["w"] * rect["h"] if rect["w"] * rect["h"] else 1
+        fill_real = area_bloco / area_livre
+        faixa_lateral = rect["x"] > chapa_w * 0.35 and rect["h"] >= chapa_h * 0.25
+        faixa_inferior = rect["y"] > chapa_h * 0.35 and rect["w"] >= chapa_w * 0.25
+
+        # Prioridade forte para sobras laterais/inferiores; depois por preenchimento.
+        prioridade_sobra = 0
+        if faixa_lateral:
+            prioridade_sobra = -3
+        elif faixa_inferior:
+            prioridade_sobra = -2
+        elif rect["x"] > 0 or rect["y"] > 0:
+            prioridade_sobra = -1
+
+        score_global = (
+            prioridade_sobra,
+            -fill_real,
+            score,
+            gi,
+        )
+        item = (score_global, gi, grupo, rect, w, h, girada, cap, secundaria)
+        if melhor_global is None or item[0] < melhor_global[0]:
+            melhor_global = item
+    return melhor_global
+
+
+def _plano_industrial_uniforme_estrategia(pecas, chapa_w, chapa_h, kerf, permite_girar, ordenacao="area_desc"):
+    """Plano industrial contínuo: preenche uma chapa com todos os códigos possíveis antes de abrir outra.
+
+    Diferença da versão anterior:
+    - antes, o sistema terminava um código inteiro e podia abrir várias chapas antes de tentar outros códigos;
+    - agora, ele abre uma chapa, coloca o bloco principal e fica procurando outros códigos restantes que caibam nas sobras;
+    - quando a quantidade da travessa/faixa acabar, ele usa as peças restantes do lote no mesmo espaço, se couberem;
+    - a rotação 90° continua permitida, mas em blocos organizados.
     """
     inicio = time.time()
     grupos = _grupos_uniformes(pecas, ordenacao)
     chapas = []
 
     while any(int(g.get("count", 0)) > 0 for g in grupos):
-        if _tempo_esgotado(inicio) and chapas:
-            # Se o tempo acabar, continua com uma estratégia simples e previsível.
-            pass
+        ch = _chapa_vazia(chapa_w, chapa_h)
+        adicionar_sequencia(ch, "Abrir nova chapa e preencher continuamente com códigos restantes.")
+        pecas_antes = 0
 
-        progresso = False
-        for grupo in grupos:
-            while int(grupo.get("count", 0)) > 0:
-                melhor = _melhor_bloco_uniforme(chapas, grupo, chapa_w, chapa_h, kerf, permite_girar)
-                if melhor is None:
-                    # Abre nova chapa e força a melhor orientação de bloco na chapa inteira.
-                    ch = _chapa_vazia(chapa_w, chapa_h)
-                    adicionar_sequencia(ch, "Abrir nova chapa para bloco uniforme.")
-                    chapas.append(ch)
-                    melhor = _melhor_bloco_uniforme(chapas[-1:], grupo, chapa_w, chapa_h, kerf, permite_girar)
-                    if melhor is None:
-                        raise ValueError(f"Peça código {grupo['peca'].get('codigo','')} não cabe na chapa {int(chapa_w*1000)} x {int(chapa_h*1000)} mm.")
-                    # ajustar índice local para índice real da chapa recém-criada
-                    _, _, ri, rect, w, h, girada, cap, secundaria = melhor
-                    _inserir_bloco_uniforme(chapas[-1], grupo, rect, w, h, girada, cap, chapa_w, chapa_h, kerf)
-                    progresso = True
-                else:
-                    _, ci, ri, rect, w, h, girada, cap, secundaria = melhor
-                    _inserir_bloco_uniforme(chapas[ci], grupo, rect, w, h, girada, cap, chapa_w, chapa_h, kerf)
-                    progresso = True
-                # Evita laço pesado demais em Render; o plano continua estável.
-                if _tempo_esgotado(inicio) and len(chapas) > 0:
-                    break
-            if _tempo_esgotado(inicio) and len(chapas) > 0:
-                # Continua sem testar variações extras, mas não abandona peças.
-                continue
-        if not progresso:
+        # Preenche esta chapa até não caber mais nenhum grupo restante.
+        while any(int(g.get("count", 0)) > 0 for g in grupos):
+            primeiro = len(ch.get("pecas", [])) == 0
+            melhor = _melhor_bloco_global_na_chapa(ch, grupos, chapa_w, chapa_h, kerf, permite_girar, primeiro_bloco=primeiro)
+            if melhor is None:
+                break
+            _, gi, grupo, rect, w, h, girada, cap, secundaria = melhor
+            _inserir_bloco_uniforme(ch, grupo, rect, w, h, girada, cap, chapa_w, chapa_h, kerf)
+
+            # Segurança contra laços longos no Render; ainda assim não abandona a chapa vazia.
+            if _tempo_esgotado(inicio) and len(ch.get("pecas", [])) > pecas_antes:
+                break
+            pecas_antes = len(ch.get("pecas", []))
+
+        if not ch.get("pecas"):
+            # Nenhum grupo coube em uma chapa vazia: existe peça maior que a chapa.
+            faltando = next((g for g in grupos if int(g.get("count", 0)) > 0), None)
+            if faltando:
+                raise ValueError(f"Peça código {faltando['peca'].get('codigo','')} não cabe na chapa {int(chapa_w*1000)} x {int(chapa_h*1000)} mm.")
             break
 
-    return finalizar_chapas(chapas, chapa_w, chapa_h, "industrial", f"Industrial com lateral reforçada / {ordenacao}")
+        chapas.append(ch)
+
+    return finalizar_chapas(chapas, chapa_w, chapa_h, "industrial", f"Industrial com preenchimento contínuo / {ordenacao}")
 
 
 def plano_industrial_uniforme(pecas, chapa_w, chapa_h, kerf, permite_girar):
@@ -2132,7 +2185,7 @@ def pagina_corte(result_html=""):
         </div>
         <div class="toolbar no-print"><button type="button" class="btn" onclick="limparEntrada()">Limpar entrada</button><button type="button" class="btn" onclick="exemploEntrada()">Preencher exemplo</button></div>
         {datalist_codigos()}
-        <div class="row2" style="margin-top:12px"><div><label class="hint">Tipo de plano de corte</label><select name="modo_corte"><option value="industrial">Industrial com lateral reforçada</option><option value="otimizado">Otimizado comparativo</option><option value="guilhotina">Guilhotina por faixas</option><option value="oportunidades">Oportunidades agressivo</option><option value="encaixe">Encaixe livre tradicional</option></select></div><div><label class="hint">Salvar histórico</label><select name="salvar_historico"><option value="1">Sim</option><option value="0">Não</option></select></div><div><label class="hint">Ação</label><select name="acao"><option value="calcular">Apenas calcular consumo</option><option value="plano">Calcular e gerar plano de corte</option></select></div></div>
+        <div class="row2" style="margin-top:12px"><div><label class="hint">Tipo de plano de corte</label><select name="modo_corte"><option value="industrial">Industrial com preenchimento contínuo</option><option value="otimizado">Otimizado comparativo</option><option value="guilhotina">Guilhotina por faixas</option><option value="oportunidades">Oportunidades agressivo</option><option value="encaixe">Encaixe livre tradicional</option></select></div><div><label class="hint">Salvar histórico</label><select name="salvar_historico"><option value="1">Sim</option><option value="0">Não</option></select></div><div><label class="hint">Ação</label><select name="acao"><option value="calcular">Apenas calcular consumo</option><option value="plano">Calcular e gerar plano de corte</option></select></div></div>
         <div class="actions"><button class="btn primary" type="submit">Executar</button><button type="button" class="btn" onclick="window.print()">Imprimir / salvar PDF</button></div>
     </form>{result_html}
     <script>
@@ -2334,7 +2387,7 @@ def svg_chapa(chapa):
 
 def _nome_modo_plano(modo):
     if modo == "industrial":
-        return "Industrial com lateral reforçada"
+        return "Industrial com preenchimento contínuo"
     if modo == "guilhotina":
         return "Guilhotina por faixas"
     if modo == "oportunidades":
@@ -2425,7 +2478,7 @@ def html_planos(planos):
         return ""
     html = [
         '<div class="card"><h2>Plano de corte visual</h2>'
-        '<p class="hint">O modo recomendado agora é Industrial com lateral reforçada: peças iguais ficam agrupadas em blocos/faixas. A lógica prioriza o preenchimento de laterais e rodapés com blocos girados 90° quando couber, sem espalhar peças de forma bagunçada.</p></div>',
+        '<p class="hint">O modo recomendado agora é Industrial com preenchimento contínuo: peças iguais ficam agrupadas em blocos/faixas. A lógica prioriza o preenchimento de laterais e rodapés com blocos girados 90° quando couber, sem espalhar peças de forma bagunçada.</p></div>',
         resumo_planos_por_tipo_html(planos),
     ]
     for grupo in planos:
