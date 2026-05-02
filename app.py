@@ -1485,6 +1485,207 @@ def _plano_shelf_backfill_estrategia(pecas, chapa_w, chapa_h, kerf, permite_gira
     return _finalizar_com_compactacao(chapas, chapa_w, chapa_h, "guilhotina", f"Faixas com backfill de sobras / {ordenacao}", kerf, permite_girar, inicio=inicio)
 
 
+
+# ============================================================
+# PLANO INDUSTRIAL UNIFORME: PEÇAS IGUAIS EM BLOCOS/FAIXAS
+# ============================================================
+
+def _chave_grupo_uniforme(peca):
+    return (
+        str(peca.get("codigo", "")),
+        round(float(peca.get("w", 0)), 6),
+        round(float(peca.get("h", 0)), 6),
+        str(peca.get("material", "")),
+    )
+
+
+def _grupos_uniformes(pecas, ordenacao="area_desc"):
+    grupos_map = {}
+    ordem = []
+    for p in pecas:
+        chave = _chave_grupo_uniforme(p)
+        if chave not in grupos_map:
+            grupos_map[chave] = {"peca": dict(p), "count": 0, "orientacao": None, "chave": chave}
+            ordem.append(chave)
+        grupos_map[chave]["count"] += 1
+    grupos = [grupos_map[k] for k in ordem]
+
+    def area(g):
+        p = g["peca"]
+        return float(p["w"]) * float(p["h"])
+    def maior_lado(g):
+        p = g["peca"]
+        return max(float(p["w"]), float(p["h"]))
+    def menor_lado(g):
+        p = g["peca"]
+        return min(float(p["w"]), float(p["h"]))
+
+    if ordenacao == "count_desc":
+        grupos.sort(key=lambda g: (g["count"], area(g), maior_lado(g)), reverse=True)
+    elif ordenacao == "lado_maior_desc":
+        grupos.sort(key=lambda g: (maior_lado(g), area(g), g["count"]), reverse=True)
+    elif ordenacao == "estreitas_depois":
+        grupos.sort(key=lambda g: (menor_lado(g), area(g), g["count"]), reverse=True)
+    else:
+        grupos.sort(key=lambda g: (area(g), maior_lado(g), g["count"]), reverse=True)
+    return grupos
+
+
+def _orientacoes_grupo_uniforme(grupo, permite_girar):
+    if grupo.get("orientacao") is not None:
+        return [grupo["orientacao"]]
+    return _orientacoes_possiveis(grupo["peca"], permite_girar)
+
+
+def _capacidade_bloco_uniforme(rect, w, h, kerf, restante):
+    if restante <= 0 or w <= 0 or h <= 0:
+        return None
+    cols = int(math.floor((float(rect["w"]) + kerf + 1e-9) / (w + kerf)))
+    rows = int(math.floor((float(rect["h"]) + kerf + 1e-9) / (h + kerf)))
+    if cols <= 0 or rows <= 0:
+        return None
+    cap = cols * rows
+    qtd = min(int(restante), cap)
+    if qtd <= 0:
+        return None
+    linhas_usadas = int(math.ceil(qtd / cols))
+    if linhas_usadas <= 1:
+        cols_usadas = qtd
+    else:
+        cols_usadas = cols
+    bloco_w = cols_usadas * w + max(0, cols_usadas - 1) * kerf
+    bloco_h = linhas_usadas * h + max(0, linhas_usadas - 1) * kerf
+    if bloco_w > rect["w"] + 1e-9 or bloco_h > rect["h"] + 1e-9:
+        return None
+    densidade = (qtd * w * h) / (bloco_w * bloco_h) if bloco_w * bloco_h else 0.0
+    return {
+        "qtd": qtd,
+        "cols": cols,
+        "cols_usadas": cols_usadas,
+        "linhas_usadas": linhas_usadas,
+        "bloco_w": bloco_w,
+        "bloco_h": bloco_h,
+        "densidade": densidade,
+    }
+
+
+def _melhor_bloco_uniforme(chapas, grupo, chapa_w, chapa_h, kerf, permite_girar):
+    melhor = None
+    restante = int(grupo.get("count", 0))
+    if restante <= 0:
+        return None
+    for ci, ch in enumerate(chapas):
+        for ri, rect in enumerate(ch.get("livres", [])):
+            for w, h, girada in _orientacoes_grupo_uniforme(grupo, permite_girar):
+                cap = _capacidade_bloco_uniforme(rect, w, h, kerf, restante)
+                if not cap:
+                    continue
+                # Pontuação: prioriza encaixar muitas peças iguais juntas,
+                # alta densidade, origem superior/esquerda e pouca sobra no retângulo livre.
+                sobra_ret = (rect["w"] * rect["h"]) - (cap["bloco_w"] * cap["bloco_h"])
+                encosta = 0
+                if abs(rect["x"]) < 1e-9: encosta += 1
+                if abs(rect["y"]) < 1e-9: encosta += 1
+                score = (-cap["qtd"], -cap["densidade"], -encosta, sobra_ret, rect["y"], rect["x"], ci)
+                cand = (score, ci, ri, rect, w, h, girada, cap)
+                if melhor is None or cand[0] < melhor[0]:
+                    melhor = cand
+    return melhor
+
+
+def _inserir_bloco_uniforme(ch, grupo, rect, w, h, girada, cap, chapa_w, chapa_h, kerf):
+    qtd = int(cap["qtd"])
+    cols = int(cap["cols"])
+    x0, y0 = float(rect["x"]), float(rect["y"])
+    for n in range(qtd):
+        lin = n // cols
+        col = n % cols
+        p = dict(grupo["peca"])
+        p.update({
+            "x": x0 + col * (w + kerf),
+            "y": y0 + lin * (h + kerf),
+            "w_draw": w,
+            "h_draw": h,
+            "girada": girada,
+        })
+        ch.setdefault("pecas", []).append(p)
+    grupo["count"] -= qtd
+    if grupo.get("orientacao") is None:
+        grupo["orientacao"] = (w, h, girada)
+    usado = {
+        "x": x0,
+        "y": y0,
+        "w": min(cap["bloco_w"] + kerf, chapa_w - x0),
+        "h": min(cap["bloco_h"] + kerf, chapa_h - y0),
+    }
+    ch["livres"] = _split_free_rectangles(ch.get("livres", []), usado, min_dim=max(kerf, 0.003))
+    adicionar_sequencia(ch, f"Bloco uniforme: código {grupo['peca'].get('codigo','')} com {qtd} peça(s), orientação {int(round(w*1000))} x {int(round(h*1000))} mm.")
+
+
+def _plano_industrial_uniforme_estrategia(pecas, chapa_w, chapa_h, kerf, permite_girar, ordenacao="area_desc"):
+    """Plano industrial: mantém peças iguais agrupadas e com orientação uniforme.
+
+    Esta lógica evita a 'bagunça' visual: peças de mesmo código não ficam
+    espalhadas/rotacionadas aleatoriamente. O algoritmo monta blocos regulares
+    e usa as sobras para inserir outros blocos, não peças soltas.
+    """
+    inicio = time.time()
+    grupos = _grupos_uniformes(pecas, ordenacao)
+    chapas = []
+
+    while any(int(g.get("count", 0)) > 0 for g in grupos):
+        if _tempo_esgotado(inicio) and chapas:
+            # Se o tempo acabar, continua com uma estratégia simples e previsível.
+            pass
+
+        progresso = False
+        for grupo in grupos:
+            while int(grupo.get("count", 0)) > 0:
+                melhor = _melhor_bloco_uniforme(chapas, grupo, chapa_w, chapa_h, kerf, permite_girar)
+                if melhor is None:
+                    # Abre nova chapa e força a melhor orientação de bloco na chapa inteira.
+                    ch = _chapa_vazia(chapa_w, chapa_h)
+                    adicionar_sequencia(ch, "Abrir nova chapa para bloco uniforme.")
+                    chapas.append(ch)
+                    melhor = _melhor_bloco_uniforme(chapas[-1:], grupo, chapa_w, chapa_h, kerf, permite_girar)
+                    if melhor is None:
+                        raise ValueError(f"Peça código {grupo['peca'].get('codigo','')} não cabe na chapa {int(chapa_w*1000)} x {int(chapa_h*1000)} mm.")
+                    # ajustar índice local para índice real da chapa recém-criada
+                    _, _, ri, rect, w, h, girada, cap = melhor
+                    _inserir_bloco_uniforme(chapas[-1], grupo, rect, w, h, girada, cap, chapa_w, chapa_h, kerf)
+                    progresso = True
+                else:
+                    _, ci, ri, rect, w, h, girada, cap = melhor
+                    _inserir_bloco_uniforme(chapas[ci], grupo, rect, w, h, girada, cap, chapa_w, chapa_h, kerf)
+                    progresso = True
+                # Evita laço pesado demais em Render; o plano continua estável.
+                if _tempo_esgotado(inicio) and len(chapas) > 0:
+                    break
+            if _tempo_esgotado(inicio) and len(chapas) > 0:
+                # Continua sem testar variações extras, mas não abandona peças.
+                continue
+        if not progresso:
+            break
+
+    return finalizar_chapas(chapas, chapa_w, chapa_h, "industrial", f"Industrial uniforme / {ordenacao}")
+
+
+def plano_industrial_uniforme(pecas, chapa_w, chapa_h, kerf, permite_girar):
+    ordenacoes = ["area_desc", "count_desc", "lado_maior_desc"]
+    candidatos = []
+    erros = []
+    inicio = time.time()
+    for ordenacao in ordenacoes:
+        if candidatos and _tempo_esgotado(inicio):
+            break
+        try:
+            candidatos.append(_plano_industrial_uniforme_estrategia(pecas, chapa_w, chapa_h, kerf, permite_girar, ordenacao))
+        except Exception as exc:
+            erros.append(str(exc))
+    if not candidatos and erros:
+        raise ValueError(erros[-1])
+    return _selecionar_melhor_plano(candidatos, chapa_w, chapa_h)
+
 def _aproveitamento_plano(chapas, chapa_w, chapa_h):
     area_chapa = chapa_w * chapa_h
     qtd = len(chapas)
@@ -1630,23 +1831,19 @@ def plano_guilhotina_faixas(pecas, chapa_w, chapa_h, kerf, permite_girar):
 
 
 def plano_otimizado_meta95(pecas, chapa_w, chapa_h, kerf, permite_girar):
-    """Compara estratégias e prioriza o algoritmo que preenche oportunidades de sobra."""
+    """Compara estratégias, mas privilegia plano industrial uniforme.
+
+    Se um plano bagunçado economizar apenas pouco aproveitamento, o sistema
+    escolhe o plano uniforme, porque é mais seguro para operação.
+    """
     candidatos = []
     erros = []
 
-    # 1) Primeiro roda o algoritmo certo para o problema: preencher sobras úteis.
-    # 2) Depois compara com guilhotina e MaxRects tradicional.
-    for fn in (plano_guilhotina_faixas, plano_oportunidades_sobra, plano_encaixe_livre):
+    for fn in (plano_industrial_uniforme, plano_guilhotina_faixas, plano_oportunidades_sobra, plano_encaixe_livre):
         try:
             plano = fn(pecas, chapa_w, chapa_h, kerf, permite_girar)
             if plano:
                 candidatos.append(plano)
-                meta = _metadados_plano(plano, chapa_w, chapa_h)
-                if meta["meta_atingida"] and meta["chapas_total"] <= meta["chapas_min_area"]:
-                    melhor = plano
-                    for ch in melhor:
-                        ch["modo"] = "otimizado"
-                    return melhor
         except Exception as exc:
             erros.append(str(exc))
 
@@ -1654,9 +1851,23 @@ def plano_otimizado_meta95(pecas, chapa_w, chapa_h, kerf, permite_girar):
         if erros:
             raise ValueError(erros[-1])
         return []
-    melhor = _selecionar_melhor_plano(candidatos, chapa_w, chapa_h)
+
+    # Se o industrial usa a mesma quantidade de chapas e fica até 3 p.p. do melhor,
+    # fica com o industrial para manter as peças iguais organizadas.
+    melhor_ap = max(_aproveitamento_plano(c, chapa_w, chapa_h) for c in candidatos)
+    min_chapas = min(len(c) for c in candidatos)
+    industriais = [c for c in candidatos if len(c) == min_chapas and all(ch.get("modo") == "industrial" for ch in c)]
+    if industriais:
+        melhor_ind = max(industriais, key=lambda c: _aproveitamento_plano(c, chapa_w, chapa_h))
+        if _aproveitamento_plano(melhor_ind, chapa_w, chapa_h) >= melhor_ap - 0.03:
+            melhor = melhor_ind
+        else:
+            melhor = _selecionar_melhor_plano(candidatos, chapa_w, chapa_h)
+    else:
+        melhor = _selecionar_melhor_plano(candidatos, chapa_w, chapa_h)
+
     for ch in melhor:
-        ch["modo"] = "otimizado"
+        ch["modo"] = "industrial" if ch.get("modo") == "industrial" else "otimizado"
     return melhor
 
 
@@ -1677,6 +1888,8 @@ def gerar_planos(itens, resumo, modo):
             chapas = plano_encaixe_livre(pecas, chapa_w, chapa_h, kerf, permite)
         elif modo == "oportunidades":
             chapas = plano_oportunidades_sobra(pecas, chapa_w, chapa_h, kerf, permite)
+        elif modo == "industrial":
+            chapas = plano_industrial_uniforme(pecas, chapa_w, chapa_h, kerf, permite)
         else:
             chapas = plano_otimizado_meta95(pecas, chapa_w, chapa_h, kerf, permite)
 
@@ -1808,7 +2021,7 @@ def pagina_corte(result_html=""):
         </div>
         <div class="toolbar no-print"><button type="button" class="btn" onclick="limparEntrada()">Limpar entrada</button><button type="button" class="btn" onclick="exemploEntrada()">Preencher exemplo</button></div>
         {datalist_codigos()}
-        <div class="row2" style="margin-top:12px"><div><label class="hint">Tipo de plano de corte</label><select name="modo_corte"><option value="otimizado">Otimizado com compactação de sobras</option><option value="oportunidades">Oportunidades + compactação de sobras</option><option value="encaixe">Encaixe livre tradicional</option><option value="guilhotina">Guilhotina por faixas</option></select></div><div><label class="hint">Salvar histórico</label><select name="salvar_historico"><option value="1">Sim</option><option value="0">Não</option></select></div><div><label class="hint">Ação</label><select name="acao"><option value="calcular">Apenas calcular consumo</option><option value="plano">Calcular e gerar plano de corte</option></select></div></div>
+        <div class="row2" style="margin-top:12px"><div><label class="hint">Tipo de plano de corte</label><select name="modo_corte"><option value="industrial">Industrial uniforme recomendado</option><option value="otimizado">Otimizado comparativo</option><option value="guilhotina">Guilhotina por faixas</option><option value="oportunidades">Oportunidades agressivo</option><option value="encaixe">Encaixe livre tradicional</option></select></div><div><label class="hint">Salvar histórico</label><select name="salvar_historico"><option value="1">Sim</option><option value="0">Não</option></select></div><div><label class="hint">Ação</label><select name="acao"><option value="calcular">Apenas calcular consumo</option><option value="plano">Calcular e gerar plano de corte</option></select></div></div>
         <div class="actions"><button class="btn primary" type="submit">Executar</button><button type="button" class="btn" onclick="window.print()">Imprimir / salvar PDF</button></div>
     </form>{result_html}
     <script>
@@ -1973,7 +2186,7 @@ def svg_chapa(chapa):
         codigo = html_escape(p.get("codigo", ""))
         desc = html_escape(str(p.get("descricao", "")))
         medida = f"{int(round(float(p['w_draw'])*1000))}x{int(round(float(p['h_draw'])*1000))}"
-        fill = cor_hash(f"{p.get('codigo', '')}-{i}")
+        fill = cor_hash(p.get("codigo", i))
 
         area_mm2 = w * h
         if area_mm2 < 90000:
@@ -2009,12 +2222,14 @@ def svg_chapa(chapa):
 
 
 def _nome_modo_plano(modo):
+    if modo == "industrial":
+        return "Industrial uniforme"
     if modo == "guilhotina":
         return "Guilhotina por faixas"
     if modo == "oportunidades":
-        return "Oportunidades + compactação de sobras"
+        return "Oportunidades agressivo"
     if modo == "otimizado":
-        return "Otimizado com compactação de sobras"
+        return "Otimizado comparativo"
     return "Encaixe livre tradicional"
 
 
@@ -2099,7 +2314,7 @@ def html_planos(planos):
         return ""
     html = [
         '<div class="card"><h2>Plano de corte visual</h2>'
-        '<p class="hint">O sistema procura oportunidades de sobra: antes de abrir uma nova chapa, ele testa quais peças restantes cabem nos vazios das chapas atuais. A sequência operacional detalhada foi removida desta tela para deixar o resultado mais leve.</p></div>',
+        '<p class="hint">O modo recomendado agora é Industrial uniforme: peças iguais ficam agrupadas em blocos/faixas e com a mesma orientação, evitando planos bagunçados. O sistema ainda usa sobras, mas sem espalhar peças iguais aleatoriamente.</p></div>',
         resumo_planos_por_tipo_html(planos),
     ]
     for grupo in planos:
