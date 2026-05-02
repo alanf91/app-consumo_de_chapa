@@ -1597,8 +1597,10 @@ def _melhor_bloco_uniforme(chapas, grupo, chapa_w, chapa_h, kerf, permite_girar)
     for ci, ch in enumerate(chapas):
         for ri, rect in enumerate(ch.get("livres", [])):
             # Detecta sobras com cara de faixa lateral ou inferior.
-            faixa_lateral = rect["x"] > chapa_w * 0.45 and rect["w"] <= chapa_w * 0.38 and rect["h"] >= chapa_h * 0.25
-            faixa_inferior = rect["y"] > chapa_h * 0.45 and rect["h"] <= chapa_h * 0.38 and rect["w"] >= chapa_w * 0.25
+            # A faixa lateral é prioridade porque normalmente é a perda que mais aparece
+            # depois de blocos grandes, e pode receber peças estreitas giradas 90°.
+            faixa_lateral = rect["x"] > chapa_w * 0.40 and rect["w"] <= chapa_w * 0.42 and rect["h"] >= chapa_h * 0.35
+            faixa_inferior = rect["y"] > chapa_h * 0.40 and rect["h"] <= chapa_h * 0.42 and rect["w"] >= chapa_w * 0.35
             faixa_qualquer = faixa_lateral or faixa_inferior or rect["x"] > 0 or rect["y"] > 0
 
             for w, h, girada in _orientacoes_grupo_uniforme(grupo, permite_girar, permitir_secundaria=faixa_qualquer):
@@ -1613,6 +1615,10 @@ def _melhor_bloco_uniforme(chapas, grupo, chapa_w, chapa_h, kerf, permite_girar)
                 sobra_ret = (rect["w"] * rect["h"]) - (cap["bloco_w"] * cap["bloco_h"])
                 fill_rect = (cap["bloco_w"] * cap["bloco_h"]) / (rect["w"] * rect["h"]) if rect["w"] * rect["h"] else 0.0
                 fill_pecas = (cap["qtd"] * w * h) / (rect["w"] * rect["h"]) if rect["w"] * rect["h"] else 0.0
+                cobre_altura_lateral = cap["bloco_h"] / rect["h"] if rect["h"] else 0.0
+                cobre_largura_lateral = cap["bloco_w"] / rect["w"] if rect["w"] else 0.0
+                cobre_largura_inferior = cap["bloco_w"] / rect["w"] if rect["w"] else 0.0
+                cobre_altura_inferior = cap["bloco_h"] / rect["h"] if rect["h"] else 0.0
 
                 encosta = 0
                 if abs(rect["x"]) < 1e-9: encosta += 1
@@ -1624,37 +1630,55 @@ def _melhor_bloco_uniforme(chapas, grupo, chapa_w, chapa_h, kerf, permite_girar)
                 residuo_h = max(0.0, rect["h"] - cap["bloco_h"])
                 residuo_fino = min(residuo_w, residuo_h)
 
-                # Pontuação:
-                # 1) Se for rotação 90° em faixa lateral/inferior e preencher bem, bonifica.
-                # 2) Se for rotação fora de faixa, penaliza muito para não bagunçar.
-                # 3) Continua priorizando quantidade em bloco e densidade.
-                if secundaria:
-                    if (faixa_lateral or faixa_inferior) and fill_rect >= 0.55:
-                        classe = -2  # preencher faixa marcada é prioridade
-                    elif faixa_qualquer and fill_rect >= 0.68:
-                        classe = -1
-                    else:
-                        classe = 5   # rotação ruim: evita
-                else:
-                    classe = 0
-
-                # Em faixas laterais, valoriza peças giradas formando coluna/bloco.
+                # Classe de prioridade:
+                # -4: preencher lateral com bloco organizado, mesmo que caiba menos peças do que no rodapé.
+                # -3: preencher inferior com bloco organizado.
+                # -2/-1: rotações complementares boas em sobras.
+                #  0: bloco normal.
+                #  5: rotação sem benefício claro, evita bagunça.
+                classe = 0
                 bonus_faixa = 0
-                if secundaria and faixa_lateral:
-                    bonus_faixa = -2
-                elif secundaria and faixa_inferior:
-                    bonus_faixa = -1
+
+                if faixa_lateral and fill_rect >= 0.32 and cobre_largura_lateral >= 0.42 and cobre_altura_lateral >= 0.35:
+                    classe = -4
+                    bonus_faixa = -4
+                elif faixa_inferior and fill_rect >= 0.32 and cobre_largura_inferior >= 0.35 and cobre_altura_inferior >= 0.42:
+                    classe = -3
+                    bonus_faixa = -3
+
+                if secundaria:
+                    if faixa_lateral and fill_rect >= 0.25 and cobre_largura_lateral >= 0.35:
+                        classe = min(classe, -4)
+                        bonus_faixa -= 2
+                    elif faixa_inferior and fill_rect >= 0.30 and cobre_altura_inferior >= 0.35:
+                        classe = min(classe, -3)
+                        bonus_faixa -= 1
+                    elif faixa_qualquer and fill_rect >= 0.62:
+                        classe = min(classe, -1)
+                    else:
+                        classe = max(classe, 5)
+
+                # Se o grupo ainda não tem orientação principal, também podemos priorizar
+                # uma das duas orientações quando ela encaixa melhor na faixa lateral.
+                if orient_principal is None:
+                    if faixa_lateral and fill_rect >= 0.32 and cobre_largura_lateral >= 0.42:
+                        classe = min(classe, -4)
+                    elif faixa_inferior and fill_rect >= 0.32 and cobre_altura_inferior >= 0.42:
+                        classe = min(classe, -3)
 
                 # Evita escolher um bloco minúsculo quando existe outro que preenche melhor.
-                penal_fill_baixo = 1 if fill_rect < 0.35 else 0
+                penal_fill_baixo = 1 if fill_rect < 0.25 else 0
 
+                # Importante: classe vem antes da quantidade. Assim, uma faixa lateral útil
+                # é preenchida antes de jogar todas as peças no rodapé, como aconteceu no print.
                 score = (
                     classe,
                     bonus_faixa,
                     penal_fill_baixo,
-                    -cap["qtd"],
+                    -fill_rect,
                     -fill_pecas,
                     -cap["densidade"],
+                    -cap["qtd"],
                     sobra_ret,
                     -encosta,
                     residuo_fino,
@@ -1754,7 +1778,7 @@ def _plano_industrial_uniforme_estrategia(pecas, chapa_w, chapa_h, kerf, permite
         if not progresso:
             break
 
-    return finalizar_chapas(chapas, chapa_w, chapa_h, "industrial", f"Industrial com preenchimento lateral / {ordenacao}")
+    return finalizar_chapas(chapas, chapa_w, chapa_h, "industrial", f"Industrial com lateral reforçada / {ordenacao}")
 
 
 def plano_industrial_uniforme(pecas, chapa_w, chapa_h, kerf, permite_girar):
@@ -2108,7 +2132,7 @@ def pagina_corte(result_html=""):
         </div>
         <div class="toolbar no-print"><button type="button" class="btn" onclick="limparEntrada()">Limpar entrada</button><button type="button" class="btn" onclick="exemploEntrada()">Preencher exemplo</button></div>
         {datalist_codigos()}
-        <div class="row2" style="margin-top:12px"><div><label class="hint">Tipo de plano de corte</label><select name="modo_corte"><option value="industrial">Industrial com preenchimento lateral</option><option value="otimizado">Otimizado comparativo</option><option value="guilhotina">Guilhotina por faixas</option><option value="oportunidades">Oportunidades agressivo</option><option value="encaixe">Encaixe livre tradicional</option></select></div><div><label class="hint">Salvar histórico</label><select name="salvar_historico"><option value="1">Sim</option><option value="0">Não</option></select></div><div><label class="hint">Ação</label><select name="acao"><option value="calcular">Apenas calcular consumo</option><option value="plano">Calcular e gerar plano de corte</option></select></div></div>
+        <div class="row2" style="margin-top:12px"><div><label class="hint">Tipo de plano de corte</label><select name="modo_corte"><option value="industrial">Industrial com lateral reforçada</option><option value="otimizado">Otimizado comparativo</option><option value="guilhotina">Guilhotina por faixas</option><option value="oportunidades">Oportunidades agressivo</option><option value="encaixe">Encaixe livre tradicional</option></select></div><div><label class="hint">Salvar histórico</label><select name="salvar_historico"><option value="1">Sim</option><option value="0">Não</option></select></div><div><label class="hint">Ação</label><select name="acao"><option value="calcular">Apenas calcular consumo</option><option value="plano">Calcular e gerar plano de corte</option></select></div></div>
         <div class="actions"><button class="btn primary" type="submit">Executar</button><button type="button" class="btn" onclick="window.print()">Imprimir / salvar PDF</button></div>
     </form>{result_html}
     <script>
@@ -2310,7 +2334,7 @@ def svg_chapa(chapa):
 
 def _nome_modo_plano(modo):
     if modo == "industrial":
-        return "Industrial com preenchimento lateral"
+        return "Industrial com lateral reforçada"
     if modo == "guilhotina":
         return "Guilhotina por faixas"
     if modo == "oportunidades":
@@ -2401,7 +2425,7 @@ def html_planos(planos):
         return ""
     html = [
         '<div class="card"><h2>Plano de corte visual</h2>'
-        '<p class="hint">O modo recomendado agora é Industrial com preenchimento lateral: peças iguais ficam agrupadas em blocos/faixas e com a mesma orientação. A nova versão também permite rotação 90° controlada apenas para preencher faixas de sobra, sem bagunçar o plano.</p></div>',
+        '<p class="hint">O modo recomendado agora é Industrial com lateral reforçada: peças iguais ficam agrupadas em blocos/faixas. A lógica prioriza o preenchimento de laterais e rodapés com blocos girados 90° quando couber, sem espalhar peças de forma bagunçada.</p></div>',
         resumo_planos_por_tipo_html(planos),
     ]
     for grupo in planos:
