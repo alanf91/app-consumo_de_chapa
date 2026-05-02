@@ -59,6 +59,7 @@ MAX_PECAS_PLANO = int(os.environ.get("MAX_PECAS_PLANO", "7000"))
 # Limites de segurança para não travar o Render em lotes grandes.
 MAX_SEGUNDOS_OTIMIZACAO = float(os.environ.get("MAX_SEGUNDOS_OTIMIZACAO", "8"))
 MAX_LINHAS_SEQUENCIA = int(os.environ.get("MAX_LINHAS_SEQUENCIA", "60"))
+MAX_SEGUNDOS_COMPACTACAO = float(os.environ.get("MAX_SEGUNDOS_COMPACTACAO", "5"))
 
 LOGO_DOBUE_DATA = "/static/logos/dobue.png"
 LOGO_GRAUNA_DATA = "/static/logos/grauna.png"
@@ -1073,7 +1074,176 @@ def _plano_oportunidades_estrategia(pecas, chapa_w, chapa_h, kerf, permite_girar
 
         chapas.append(ch)
 
-    return finalizar_chapas(chapas, chapa_w, chapa_h, "oportunidades", f"Oportunidades de sobra / {ordenacao}")
+    return _finalizar_com_compactacao(chapas, chapa_w, chapa_h, "oportunidades", f"Oportunidades + compactação de sobras / {ordenacao}", kerf, permite_girar, inicio=inicio)
+
+
+# ============================================================
+# PÓS-OTIMIZAÇÃO: PREENCHER VAZIOS COM PEÇAS DE CHAPAS POSTERIORES
+# ============================================================
+
+def _recalcular_livres_chapa(ch, chapa_w, chapa_h, kerf):
+    """Reconstrói os espaços livres reais da chapa após todas as peças posicionadas.
+
+    Esta função é essencial para enxergar aquela faixa branca lateral/inferior que
+    ainda pode receber peças giradas ou peças menores vindas de chapas posteriores.
+    """
+    livres = [{"x": 0.0, "y": 0.0, "w": chapa_w, "h": chapa_h}]
+    for p in ch.get("pecas", []):
+        usado = {
+            "x": float(p["x"]),
+            "y": float(p["y"]),
+            "w": min(float(p["w_draw"]) + kerf, chapa_w - float(p["x"])),
+            "h": min(float(p["h_draw"]) + kerf, chapa_h - float(p["y"])),
+        }
+        livres = _split_free_rectangles(livres, usado, min_dim=max(kerf, 0.003))
+    ch["livres"] = livres
+    return livres
+
+
+def _area_retangulo(r):
+    return max(0.0, float(r.get("w", 0))) * max(0.0, float(r.get("h", 0)))
+
+
+def _tempo_compactacao_esgotado(inicio):
+    return (time.time() - inicio) >= MAX_SEGUNDOS_COMPACTACAO
+
+
+def _melhor_posicao_para_mover(ch_alvo, peca, chapa_w, chapa_h, kerf, permite_girar):
+    """Procura a melhor posição em uma chapa já existente para uma peça vinda de outra chapa."""
+    melhor = None
+    livres = sorted(ch_alvo.get("livres", []), key=lambda r: (_area_retangulo(r), r["y"], r["x"]))
+    for rect in livres:
+        if rect["w"] <= max(kerf, 0.003) or rect["h"] <= max(kerf, 0.003):
+            continue
+        for w, h, girada in _orientacoes_possiveis(peca, permite_girar):
+            if w > rect["w"] + 1e-9 or h > rect["h"] + 1e-9:
+                continue
+            x, y = rect["x"], rect["y"]
+            if x + w > chapa_w + 1e-9 or y + h > chapa_h + 1e-9:
+                continue
+            if _candidato_interfere_com_pecas(ch_alvo, x, y, w, h, kerf):
+                continue
+
+            area_peca = w * h
+            area_rect = rect["w"] * rect["h"]
+            preenchimento = area_peca / area_rect if area_rect else 0.0
+            sobra_w = max(rect["w"] - w, 0.0)
+            sobra_h = max(rect["h"] - h, 0.0)
+            short_side = min(sobra_w, sobra_h)
+            long_side = max(sobra_w, sobra_h)
+            contato = _contato_score(ch_alvo, x, y, w, h, chapa_w, chapa_h)
+
+            # Prioridade da pós-otimização:
+            # 1) ocupar melhor o vazio existente;
+            # 2) preferir orientação girada quando ela é a que cabe/preenche melhor;
+            # 3) encostar em bordas/peças para deixar desenho mais limpo;
+            # 4) usar maior área possível.
+            score = (
+                -preenchimento,
+                short_side,
+                long_side,
+                -contato,
+                -area_peca,
+                0 if girada else 1,
+                y,
+                x,
+            )
+            cand = (score, rect, x, y, w, h, girada)
+            if melhor is None or cand[0] < melhor[0]:
+                melhor = cand
+    return melhor
+
+
+def _mover_peca_para_chapa(ch_origem, idx_peca, ch_alvo, pos, chapa_w, chapa_h, kerf):
+    """Remove uma peça de uma chapa posterior e coloca no vazio da chapa alvo."""
+    _, rect, x, y, w, h, girada = pos
+    p = dict(ch_origem["pecas"].pop(idx_peca))
+    p.update({"x": x, "y": y, "w_draw": w, "h_draw": h, "girada": girada})
+    ch_alvo.setdefault("pecas", []).append(p)
+    adicionar_sequencia(ch_alvo, f"Realocar código {p.get('codigo','')} para sobra útil em X={int(round(x*1000))} / Y={int(round(y*1000))} mm.")
+
+    usado = {"x": x, "y": y, "w": min(w + kerf, chapa_w - x), "h": min(h + kerf, chapa_h - y)}
+    ch_alvo["livres"] = _split_free_rectangles(ch_alvo.get("livres", []), usado, min_dim=max(kerf, 0.003))
+    _recalcular_livres_chapa(ch_origem, chapa_w, chapa_h, kerf)
+
+
+def _compactar_chapas_com_sobras(chapas, chapa_w, chapa_h, kerf, permite_girar, inicio=None):
+    """Segunda passada: aproveita faixas brancas das chapas anteriores.
+
+    A geração inicial pode deixar uma faixa branca lateral e depois abrir novas chapas.
+    Esta rotina olha para as chapas posteriores, pega peças que ainda estão nelas e
+    tenta realocar nos vazios das chapas anteriores, testando também rotação de 90°.
+    Se uma chapa posterior ficar vazia, ela é removida do plano.
+    """
+    if not chapas or len(chapas) <= 1:
+        return chapas
+    if inicio is None:
+        inicio = time.time()
+
+    for ch in chapas:
+        _recalcular_livres_chapa(ch, chapa_w, chapa_h, kerf)
+
+    total_pecas = sum(len(ch.get("pecas", [])) for ch in chapas)
+    limite_movimentos = max(50, min(total_pecas * 2, 3000))
+    movimentos = 0
+
+    alvo_idx = 0
+    while alvo_idx < len(chapas) - 1 and movimentos < limite_movimentos:
+        if _tempo_compactacao_esgotado(inicio):
+            break
+        ch_alvo = chapas[alvo_idx]
+        _recalcular_livres_chapa(ch_alvo, chapa_w, chapa_h, kerf)
+
+        mudou_alvo = True
+        while mudou_alvo and movimentos < limite_movimentos:
+            if _tempo_compactacao_esgotado(inicio):
+                break
+            mudou_alvo = False
+            melhor = None
+
+            # Procura peças nas ÚLTIMAS chapas primeiro, para tentar eliminar chapas no final.
+            for src_idx in range(len(chapas) - 1, alvo_idx, -1):
+                ch_src = chapas[src_idx]
+                for pi, p in enumerate(ch_src.get("pecas", [])):
+                    pos = _melhor_posicao_para_mover(ch_alvo, p, chapa_w, chapa_h, kerf, permite_girar)
+                    if pos is None:
+                        continue
+                    area_peca = pos[4] * pos[5]
+                    score = (pos[0], -src_idx, -area_peca, pi)
+                    if melhor is None or score < melhor[0]:
+                        melhor = (score, src_idx, pi, pos)
+
+            if melhor is None:
+                break
+
+            _, src_idx, pi, pos = melhor
+            ch_src = chapas[src_idx]
+            _mover_peca_para_chapa(ch_src, pi, ch_alvo, pos, chapa_w, chapa_h, kerf)
+            movimentos += 1
+            mudou_alvo = True
+
+            # Remove chapa que ficou completamente vazia.
+            if not ch_src.get("pecas"):
+                chapas.pop(src_idx)
+                if src_idx < alvo_idx:
+                    alvo_idx -= 1
+                for ch in chapas:
+                    _recalcular_livres_chapa(ch, chapa_w, chapa_h, kerf)
+
+        alvo_idx += 1
+
+    for ch in chapas:
+        ch["livres"] = _prunar_livres(ch.get("livres", []), min_dim=max(kerf, 0.003))
+    return chapas
+
+
+def _finalizar_com_compactacao(chapas, chapa_w, chapa_h, modo, estrategia, kerf, permite_girar, inicio=None):
+    """Finaliza, compacta sobras e recalcula os indicadores."""
+    chapas = finalizar_chapas(chapas, chapa_w, chapa_h, modo, estrategia)
+    if len(chapas) > 1:
+        chapas = _compactar_chapas_com_sobras(chapas, chapa_w, chapa_h, kerf, permite_girar, inicio=time.time())
+        chapas = finalizar_chapas(chapas, chapa_w, chapa_h, modo, estrategia + " + compactação de sobras")
+    return chapas
 
 
 def plano_oportunidades_sobra(pecas, chapa_w, chapa_h, kerf, permite_girar):
@@ -1133,7 +1303,7 @@ def _plano_maxrects_estrategia(pecas, chapa_w, chapa_h, kerf, permite_girar, ord
             chapas.append(ch)
         else:
             _inserir_maxrects(melhor_chapa, peca, melhor_pos[1], chapa_w, chapa_h, kerf)
-    return finalizar_chapas(chapas, chapa_w, chapa_h, "encaixe", f"MaxRects {criterio} / {ordenacao}")
+    return _finalizar_com_compactacao(chapas, chapa_w, chapa_h, "encaixe", f"MaxRects {criterio} / {ordenacao}", kerf, permite_girar)
 
 
 def _plano_shelf_estrategia(pecas, chapa_w, chapa_h, kerf, permite_girar, ordenacao, orientacao_faixas="horizontal"):
@@ -1231,7 +1401,7 @@ def _plano_shelf_backfill_estrategia(pecas, chapa_w, chapa_h, kerf, permite_gira
                 q["x"], q["y"], q["w_draw"], q["h_draw"] = old_y, old_x, old_h, old_w
                 novo["pecas"].append(q)
             chapas.append(novo)
-        return finalizar_chapas(chapas, chapa_w, chapa_h, "guilhotina", f"Faixas verticais com backfill / {ordenacao}")
+        return _finalizar_com_compactacao(chapas, chapa_w, chapa_h, "guilhotina", f"Faixas verticais com backfill / {ordenacao}", kerf, permite_girar)
 
     ordenadas = _ordenar_pecas(pecas, ordenacao)
     chapas = []
@@ -1312,7 +1482,7 @@ def _plano_shelf_backfill_estrategia(pecas, chapa_w, chapa_h, kerf, permite_gira
             faixa = criar_faixa(ch, y_proxima_faixa(ch), h)
         colocar(ch, faixa, peca, w, h, girada)
 
-    return finalizar_chapas(chapas, chapa_w, chapa_h, "guilhotina", f"Faixas com backfill de sobras / {ordenacao}")
+    return _finalizar_com_compactacao(chapas, chapa_w, chapa_h, "guilhotina", f"Faixas com backfill de sobras / {ordenacao}", kerf, permite_girar, inicio=inicio)
 
 
 def _aproveitamento_plano(chapas, chapa_w, chapa_h):
@@ -1638,7 +1808,7 @@ def pagina_corte(result_html=""):
         </div>
         <div class="toolbar no-print"><button type="button" class="btn" onclick="limparEntrada()">Limpar entrada</button><button type="button" class="btn" onclick="exemploEntrada()">Preencher exemplo</button></div>
         {datalist_codigos()}
-        <div class="row2" style="margin-top:12px"><div><label class="hint">Tipo de plano de corte</label><select name="modo_corte"><option value="otimizado">Otimizado automático com oportunidades</option><option value="oportunidades">Oportunidades de sobra</option><option value="encaixe">Encaixe livre tradicional</option><option value="guilhotina">Guilhotina por faixas</option></select></div><div><label class="hint">Salvar histórico</label><select name="salvar_historico"><option value="1">Sim</option><option value="0">Não</option></select></div><div><label class="hint">Ação</label><select name="acao"><option value="calcular">Apenas calcular consumo</option><option value="plano">Calcular e gerar plano de corte</option></select></div></div>
+        <div class="row2" style="margin-top:12px"><div><label class="hint">Tipo de plano de corte</label><select name="modo_corte"><option value="otimizado">Otimizado com compactação de sobras</option><option value="oportunidades">Oportunidades + compactação de sobras</option><option value="encaixe">Encaixe livre tradicional</option><option value="guilhotina">Guilhotina por faixas</option></select></div><div><label class="hint">Salvar histórico</label><select name="salvar_historico"><option value="1">Sim</option><option value="0">Não</option></select></div><div><label class="hint">Ação</label><select name="acao"><option value="calcular">Apenas calcular consumo</option><option value="plano">Calcular e gerar plano de corte</option></select></div></div>
         <div class="actions"><button class="btn primary" type="submit">Executar</button><button type="button" class="btn" onclick="window.print()">Imprimir / salvar PDF</button></div>
     </form>{result_html}
     <script>
@@ -1842,9 +2012,9 @@ def _nome_modo_plano(modo):
     if modo == "guilhotina":
         return "Guilhotina por faixas"
     if modo == "oportunidades":
-        return "Oportunidades de sobra"
+        return "Oportunidades + compactação de sobras"
     if modo == "otimizado":
-        return "Otimizado automático com oportunidades"
+        return "Otimizado com compactação de sobras"
     return "Encaixe livre tradicional"
 
 
